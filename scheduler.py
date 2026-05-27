@@ -246,13 +246,25 @@ def _loop(interval_sec: int):
             log_scheduler_event("KILLED", "kill_switch=1 — exiting loop", "WARN")
             break
 
-        # HEARTBEAT
-        update_scheduler_state(last_heartbeat=myt_iso())
+        # HEARTBEAT — always update next_run_at on every wake-up
+        # so the UI shows the correct upcoming sleep target, regardless
+        # of whether this wake-up actually ran a cycle.
+        next_at = myt_iso(_next_run_at(interval_sec))
+        update_scheduler_state(
+            last_heartbeat=myt_iso(),
+            next_run_at=next_at,
+        )
         log_scheduler_event("HEARTBEAT", "alive")
 
         # Check market hours
         if not _is_market_hours():
-            log_scheduler_event("SKIP", "Outside market hours")
+            from risk_manager import check_trading_time_window
+            tw = check_trading_time_window()
+            log_scheduler_event(
+                "SKIP",
+                f"Outside market hours — {tw.get('reason','closed')}. "
+                f"Sleeping until {next_at}",
+            )
         else:
             try:
                 autotrade = bool(state.get("autotrade_enabled", 0))

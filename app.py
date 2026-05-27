@@ -592,7 +592,26 @@ with tab_portfolio:
     m3.metric("Active Cost", f"RM {total_active_cost:,.0f}")
     m4.metric("Active MV", f"RM {total_active_value:,.0f}",
               f"RM {(total_active_value-total_active_cost):+,.0f}")
-    m5.metric("Active Trades", len(active))
+     m5.metric("Active Trades", len(active))
+
+    # --- Risk Dashboard ---
+    st.markdown("### 🛡️ Risk Dashboard")
+    risk_stats = get_risk_dashboard_stats(trades, equity, acc["initial_capital"])
+    r1, r2, r3, r4 = st.columns(4)
+    dd_color = ("normal" if risk_stats["drawdown_level"] == "OK"
+                else "inverse")
+    r1.metric("Drawdown", f"{risk_stats['drawdown_pct']:.2f}%",
+              delta=risk_stats["drawdown_level"], delta_color=dd_color)
+    r2.metric("Exposure", f"{risk_stats['exposure_pct']:.1f}%",
+              f"RM {risk_stats['total_exposure_rm']:,.0f}")
+    r3.metric("Positions",
+              f"{risk_stats['active_positions']}/{risk_stats['max_positions_allowed']}")
+    r4.metric("Trades today",
+              f"{risk_stats['trades_today']}/{risk_stats['trades_daily_limit']}")
+    if not risk_stats["drawdown_allowed"]:
+        st.error(f"🚨 {risk_stats['drawdown_reason']}")
+    elif risk_stats["drawdown_level"] == "WARN_DRAWDOWN":
+        st.warning(f"⚠️ {risk_stats['drawdown_reason']}")
 
     if enriched:
         st.markdown("### 📌 Active Positions")

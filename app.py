@@ -592,7 +592,7 @@ with tab_portfolio:
     m3.metric("Active Cost", f"RM {total_active_cost:,.0f}")
     m4.metric("Active MV", f"RM {total_active_value:,.0f}",
               f"RM {(total_active_value-total_active_cost):+,.0f}")
-     m5.metric("Active Trades", len(active))
+    m5.metric("Active Trades", len(active))
 
     st.markdown("### 🛡️ Risk Dashboard")
     risk_stats = get_risk_dashboard_stats(trades, equity, acc["initial_capital"])

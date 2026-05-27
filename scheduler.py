@@ -276,7 +276,7 @@ def _loop(interval_sec: int, my_pid: int):
             )
         else:
             try:
-                autotrade = bool(state.get("autotrade_enabled", 1))  # v3 default ON
+                autotrade = bool(state.get("autotrade_enabled", 1))
                 autoexit = bool(state.get("autoexit_enabled", 1))
                 t0 = time.time()
                 summary = _run_one_cycle(autotrade=autotrade, autoexit=autoexit)
@@ -448,7 +448,7 @@ def run_once() -> dict:
     """Trigger a single immediate cycle (used by 'Run now' button)."""
     state = get_scheduler_state()
     return _run_one_cycle(
-        autotrade=bool(state.get("autotrade_enabled", 1)),  # v3 default ON
+        autotrade=bool(state.get("autotrade_enabled", 1)),
         autoexit=bool(state.get("autoexit_enabled", 1)),
     )
 

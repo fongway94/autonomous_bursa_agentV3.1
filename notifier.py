@@ -52,20 +52,39 @@ def telegram_configured() -> bool:
     return bool(tok and chat)
 
 
-def send_telegram(message: str, parse_mode: str = "HTML",
+def send_telegram(message: str, parse_mode: str | None = None,
                   disable_preview: bool = True,
                   timeout: int = 10) -> tuple[bool, str | None]:
-    """Send a Telegram message. Returns (success, error)."""
+    """
+    Send a Telegram message. Returns (success, error).
+
+    parse_mode:
+      None       — plain text. Recommended. Newlines preserved natively.
+                   No HTML escaping landmines.
+      "HTML"     — only Telegram's tiny tag whitelist supported
+                   (b, i, u, s, a, code, pre, blockquote). NOT <br>.
+      "MarkdownV2" — heavy escaping required for special chars.
+
+    Telegram has a 4096-character limit per message; we truncate safely.
+    """
     token, chat_id = _telegram_creds()
     if not token or not chat_id:
         return False, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set"
+
+    # Telegram hard limit
+    if len(message) > 4000:
+        message = message[:3990] + "\n…[truncated]"
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload: dict = {
+        "chat_id": chat_id, "text": message,
+        "disable_web_page_preview": disable_preview,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
     try:
-        r = requests.post(url, json={
-            "chat_id": chat_id, "text": message,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": disable_preview,
-        }, timeout=timeout)
+        r = requests.post(url, json=payload, timeout=timeout)
         if r.status_code == 200 and r.json().get("ok"):
             return True, None
         return False, f"HTTP {r.status_code}: {r.text[:200]}"
@@ -163,7 +182,8 @@ def dispatch(event_type: str, message_text: str,
     results["dashboard"] = (True, None)
 
     if channels.get("telegram"):
-        ok, err = send_telegram(message_html)
+        # Telegram gets PLAIN TEXT (preserves \n natively, no tag whitelist headaches)
+        ok, err = send_telegram(message_text, parse_mode=None)
         results["telegram"] = (ok, err)
         _log_alert(event_type, "TELEGRAM",
                    "SENT" if ok else "FAILED",

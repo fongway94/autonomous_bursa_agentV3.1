@@ -10,15 +10,13 @@ The thread:
   2. Wakes during market hours, runs scan → auto-settle → bookkeeping.
   3. Records HEARTBEAT every cycle into scheduler_log.
   4. Honours the `kill_switch` flag in scheduler_state.
-  5. Exits cleanly when `running = 0` is set.
+  5. Exits cleanly when `running = 0` is set or owner_pid no longer matches.
 
 Thread-safety: any one Python process should run at most ONE scheduler
-thread. We enforce this with a module-global handle + an atomic
-INSERT-OR-UPDATE on scheduler_state.
-
-If the user wants a real production setup, they can run
-`python -m scheduler --daemon` from cron / Task Scheduler — the same
-loop code is reused.
+thread. We enforce this with a module-global handle PLUS a process-ID
+ownership stamp in scheduler_state — so even if a Streamlit Cloud
+redeploy leaves a ghost thread behind, that ghost will detect the
+ownership change on its next iteration and exit cleanly.
 """
 
 from __future__ import annotations
@@ -112,7 +110,7 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
         for _, row in df.iterrows():
             price_lookup[row["ticker"]] = {
                 "price": float(row["price"]),
-                "high": float(row.get("price", 0)) * 1.0,  # daily bars: high≈price
+                "high": float(row.get("price", 0)) * 1.0,
                 "low": float(row.get("price", 0)) * 1.0,
             }
         try:
@@ -124,8 +122,6 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
                 f"{summary['settled']} settled, {summary['partials']} partials",
                 payload=settle_res,
             )
-
-            # Learning loop on each closed trade
             for ev in settle_res.get("settled", []):
                 t = get_trade(ev["trade_id"])
                 if t and t.get("status") == "CLOSED":
@@ -134,13 +130,10 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
                     except Exception as e:
                         log.error(f"learning failed for trade {t['id']}: {e}")
         except Exception as e:
-            log_scheduler_event("ERROR",
-                                f"Auto-settle failed: {e}", "ERROR")
+            log_scheduler_event("ERROR", f"Auto-settle failed: {e}", "ERROR")
 
     # ---- Auto-entry on best GOLD BUYs (only if enabled) ----
     if autotrade and not df.empty:
-        # Robo-only entry window: don't open trades in the last hour
-        # (no time for the position to work before close).
         now = get_myt_now()
         entry_cutoff = now.replace(hour=16, minute=0, second=0, microsecond=0)
         if now > entry_cutoff:
@@ -162,7 +155,7 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
         gold_buys = gold_buys.head(regime.get("position_rules", {})
                                    .get("max_concurrent_positions", 5))
 
-        risk_per_trade_rm = 0.01 * acc["initial_capital"]   # 1 % of capital
+        risk_per_trade_rm = 0.01 * acc["initial_capital"]
 
         for _, row in gold_buys.iterrows():
             if row["ticker"] in active_tickers:
@@ -187,7 +180,6 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
                     "RISK_REJECTED", trade_id=None, ticker=row["ticker"],
                     actor="AGENT",
                     payload={"verdict": risk_check["final_verdict"]})
-                # v3.1: optional alert on rejection (off by default)
                 try:
                     from live_trigger import fire as _live_fire
                     _live_fire("RISK_REJECTED", trade_id=None,
@@ -230,31 +222,48 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
 # Loop
 # -------------------------------------------------------------------------
 
-def _loop(interval_sec: int):
-    """The actual background loop. Exits when _STOP_EVENT is set."""
+def _loop(interval_sec: int, my_pid: int):
+    """The actual background loop. Exits when _STOP_EVENT is set,
+    kill_switch is engaged, or a newer process has claimed ownership."""
     update_scheduler_state(
         running=1,
         last_heartbeat=myt_iso(),
         next_run_at=myt_iso(_next_run_at(interval_sec)),
         last_error="",
+        owner_pid=my_pid,
     )
-    log_scheduler_event("STARTED", f"Robo-Trader started (interval {interval_sec}s)")
+    log_scheduler_event(
+        "STARTED",
+        f"Robo-Trader started (PID {my_pid}, interval {interval_sec}s)",
+    )
 
     while not _STOP_EVENT.is_set():
         state = get_scheduler_state()
         if state.get("kill_switch", 0):
             log_scheduler_event("KILLED", "kill_switch=1 — exiting loop", "WARN")
             break
+        # Ghost-thread eviction: if another process has claimed ownership,
+        # this is a stale loop from a previous Streamlit deploy. Exit.
+        current_owner = state.get("owner_pid", 0) or 0
+        if current_owner and current_owner != my_pid:
+            log_scheduler_event(
+                "GHOST_EXIT",
+                f"PID {my_pid} exiting — current owner is PID {current_owner}",
+                "WARN",
+            )
+            break
 
         # HEARTBEAT — always update next_run_at on every wake-up
         # so the UI shows the correct upcoming sleep target, regardless
-        # of whether this wake-up actually ran a cycle.
+        # of whether this wake-up actually ran a cycle. Re-asserts our
+        # owner_pid to fend off any racing ghost thread.
         next_at = myt_iso(_next_run_at(interval_sec))
         update_scheduler_state(
             last_heartbeat=myt_iso(),
             next_run_at=next_at,
+            owner_pid=my_pid,
         )
-        log_scheduler_event("HEARTBEAT", "alive")
+        log_scheduler_event("HEARTBEAT", f"alive (PID {my_pid})")
 
         # Check market hours
         if not _is_market_hours():
@@ -296,9 +305,7 @@ def _loop(interval_sec: int):
         try:
             now = get_myt_now()
             if now.hour == 1 and now.minute < 5:
-                # 1. Prune logs to bounded size
                 prune_logs(5000)
-                # 2. Re-train the ML setup classifier with latest data
                 try:
                     from learner import train_setup_classifier
                     res = train_setup_classifier()
@@ -309,7 +316,6 @@ def _loop(interval_sec: int):
                 except Exception as e:
                     log_scheduler_event(
                         "NIGHTLY_RETRAIN", f"failed: {e}", "ERROR")
-            # 3. Auto-disable exploration once target trades reached
             from repository import closed_trades
             ss = get_scheduler_state()
             if ss.get("exploration_mode"):
@@ -329,8 +335,7 @@ def _loop(interval_sec: int):
         sleep_secs = max(60, (nxt - get_myt_now()).total_seconds())
         _STOP_EVENT.wait(timeout=sleep_secs)
 
-    update_scheduler_state(running=0,
-                           last_heartbeat=myt_iso())
+    update_scheduler_state(running=0, last_heartbeat=myt_iso())
     log_scheduler_event("STOPPED", "Robo-Trader loop exited")
 
 
@@ -339,19 +344,39 @@ def _loop(interval_sec: int):
 # -------------------------------------------------------------------------
 
 def start(interval_sec: int = 3600) -> bool:
-    """Start the background thread if not already running."""
+    """
+    Start the background thread if not already running.
+
+    Sets owner_pid to our process ID. Any older ghost loop (from a
+    previous Streamlit Cloud deploy) will detect the PID change on
+    its next iteration and exit cleanly.
+    """
     global _THREAD
     with _LOCK:
         if _THREAD is not None and _THREAD.is_alive():
             return False
         _STOP_EVENT.clear()
-        # Set running=1 BEFORE spawning so is_running() is correct immediately.
+        my_pid = os.getpid()
+        # Detect + log if a stale owner is being evicted (likely a
+        # ghost thread from a previous Streamlit Cloud deploy).
+        prev = get_scheduler_state()
+        prev_pid = prev.get("owner_pid", 0) or 0
+        if prev_pid and prev_pid != my_pid:
+            log_scheduler_event(
+                "EVICT_GHOST",
+                f"Detected previous owner PID {prev_pid}; claiming as "
+                f"PID {my_pid}. Old loop will self-terminate on next wake.",
+                "WARN",
+            )
+        # Set running=1 + owner_pid BEFORE spawning so is_running() is
+        # correct immediately and ghost loops detect the takeover.
         update_scheduler_state(
             interval_sec=interval_sec, kill_switch=0, running=1,
+            owner_pid=my_pid,
             last_heartbeat=myt_iso(),
         )
         _THREAD = threading.Thread(
-            target=_loop, args=(interval_sec,),
+            target=_loop, args=(interval_sec, my_pid),
             name="bursa-scheduler", daemon=True,
         )
         _THREAD.start()
@@ -402,7 +427,7 @@ def ensure_started(interval_sec: int = 3600,
     state = get_scheduler_state()
     hb = state.get("last_heartbeat")
     if not hb:
-        return  # never beat yet, give it time
+        return
     try:
         hb_dt = datetime.strptime(hb, "%Y-%m-%d %H:%M:%S").replace(
             tzinfo=timezone(timedelta(hours=8)))

@@ -180,6 +180,16 @@ try:
 except Exception as e:
     st.warning(f"Scheduler did not start: {e}")
 
+# v3.1 hotfix: one-time dedup of historical duplicate scheduler_log rows
+# (from the ghost-thread bug). Cheap, idempotent, runs once per session.
+if "log_deduped" not in st.session_state:
+    try:
+        from logger import dedupe_scheduler_log_at_same_second
+        dedupe_scheduler_log_at_same_second()
+    except Exception:
+        pass
+    st.session_state["log_deduped"] = True
+
 
 # =========================================================================
 # Sidebar — capital, scheduler badge, custom ticker, quick stats

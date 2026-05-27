@@ -34,13 +34,12 @@ if not _app_logger.handlers:
     )
     fh = RotatingFileHandler(
         os.path.join(LOG_DIR, "bursa_agent.log"),
-        maxBytes=2 * 1024 * 1024,  # 2 MB
+        maxBytes=2 * 1024 * 1024,
         backupCount=5,
     )
     fh.setFormatter(fmt)
     _app_logger.addHandler(fh)
 
-    # Console handler for ops visibility (Streamlit shows stdout)
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     _app_logger.addHandler(ch)
@@ -56,7 +55,6 @@ def get_logger(name: str):
 
 def log_trade_event(event: str, trade_id=None, ticker=None,
                     actor: str = "USER", payload: dict | None = None):
-    """Append a row to trade_log."""
     with connect() as c:
         c.execute(
             "INSERT INTO trade_log (timestamp, event, trade_id, ticker, actor, payload_json) "
@@ -70,7 +68,6 @@ def log_trade_event(event: str, trade_id=None, ticker=None,
 def log_scheduler_event(event: str, message: str = "",
                         level: str = "INFO", duration_sec: float | None = None,
                         payload: dict | None = None):
-    """Append a row to scheduler_log."""
     with connect() as c:
         c.execute(
             "INSERT INTO scheduler_log "
@@ -89,7 +86,6 @@ def log_scheduler_event(event: str, message: str = "",
 
 def log_learning_event(event_type: str, description: str,
                        changes: dict | None = None, metrics: dict | None = None):
-    """Append a row to learning_events."""
     with connect() as c:
         c.execute(
             "INSERT INTO learning_events "
@@ -117,7 +113,7 @@ def log_parameter_change(before: dict, after: dict, source: str, reason: str = "
 def log_bias_change(field: str, before: float, after: float,
                     trade_id: int | None = None, outcome: str | None = None):
     if abs((after or 0) - (before or 0)) < 1e-6:
-        return  # noop
+        return
     with connect() as c:
         c.execute(
             "INSERT INTO bias_history "
@@ -223,3 +219,26 @@ def prune_logs(max_rows_per_table: int = 5000):
             if cutoff_id > 0:
                 c.execute(f"DELETE FROM {tbl} WHERE id <= ?", (cutoff_id,))
     _app_logger.info(f"Pruned all log tables to last {max_rows_per_table} rows")
+
+
+def dedupe_scheduler_log_at_same_second(keep_latest: bool = True) -> int:
+    """
+    Remove duplicate scheduler_log rows that have identical
+    (timestamp, event, message). Keeps only one row per group.
+
+    Returns the number of rows deleted. Cheap one-time cleanup
+    for the v3.1 ghost-thread incident.
+    """
+    with connect() as c:
+        before = c.execute("SELECT COUNT(*) FROM scheduler_log").fetchone()[0]
+        c.execute(
+            "DELETE FROM scheduler_log WHERE id NOT IN ("
+            "  SELECT MIN(id) FROM scheduler_log "
+            "  GROUP BY timestamp, event, message"
+            ")"
+        )
+        after = c.execute("SELECT COUNT(*) FROM scheduler_log").fetchone()[0]
+    removed = before - after
+    if removed > 0:
+        _app_logger.info(f"deduped scheduler_log: removed {removed} duplicate rows")
+    return removed

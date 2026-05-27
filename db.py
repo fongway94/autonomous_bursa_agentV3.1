@@ -107,12 +107,12 @@ CREATE TABLE IF NOT EXISTS trades (
     total_outlay    REAL,
     risk_per_share  REAL,
     actual_risk_pct REAL,
-    status          TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | CLOSED | PENDING | REJECTED
-    phase           TEXT DEFAULT 'FULL',             -- FULL | PARTIAL | CLOSED
-    outcome         TEXT,                            -- WIN | LOSS | BREAKEVEN
+    status          TEXT NOT NULL DEFAULT 'ACTIVE',
+    phase           TEXT DEFAULT 'FULL',
+    outcome         TEXT,
     logged_at       TEXT NOT NULL,
     closed_at       TEXT,
-    execution_type  TEXT DEFAULT 'MANUAL',           -- AUTO | MANUAL | ML_TRIGGER
+    execution_type  TEXT DEFAULT 'MANUAL',
     market_regime   TEXT,
     regime_conviction REAL,
     confidence_score REAL,
@@ -168,7 +168,7 @@ CREATE TABLE IF NOT EXISTS parameters (
 CREATE TABLE IF NOT EXISTS parameter_history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     changed_at  TEXT NOT NULL,
-    source      TEXT,           -- USER | WALK_FORWARD | RESET | LEARNER
+    source      TEXT,
     before_json TEXT,
     after_json  TEXT,
     reason      TEXT
@@ -184,7 +184,7 @@ CREATE TABLE IF NOT EXISTS bias_state (
 CREATE TABLE IF NOT EXISTS bias_history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     changed_at  TEXT NOT NULL,
-    field       TEXT,           -- breakout_bias | pullback_bias | sector:<name>
+    field       TEXT,
     before_val  REAL,
     after_val   REAL,
     trade_id    INTEGER,
@@ -195,10 +195,10 @@ CREATE INDEX IF NOT EXISTS idx_biashist_at ON bias_history(changed_at);
 CREATE TABLE IF NOT EXISTS state_priors (
     state_id    INTEGER NOT NULL,
     action      TEXT NOT NULL,
-    alpha       REAL NOT NULL DEFAULT 1.0,   -- Beta α (wins + prior)
-    beta        REAL NOT NULL DEFAULT 1.0,   -- Beta β (losses + prior)
+    alpha       REAL NOT NULL DEFAULT 1.0,
+    beta        REAL NOT NULL DEFAULT 1.0,
     n_trades    INTEGER NOT NULL DEFAULT 0,
-    total_r     REAL NOT NULL DEFAULT 0,     -- cumulative R-multiple
+    total_r     REAL NOT NULL DEFAULT 0,
     last_updated TEXT,
     PRIMARY KEY (state_id, action)
 );
@@ -216,8 +216,8 @@ CREATE INDEX IF NOT EXISTS idx_learnev_at ON learning_events(timestamp);
 CREATE TABLE IF NOT EXISTS scheduler_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp       TEXT NOT NULL,
-    level           TEXT NOT NULL DEFAULT 'INFO',   -- INFO | WARN | ERROR
-    event           TEXT NOT NULL,                  -- HEARTBEAT | SCAN_START | SCAN_END | SETTLE_START | SETTLE_END | AUTO_ENTRY | AUTO_EXIT | ERROR
+    level           TEXT NOT NULL DEFAULT 'INFO',
+    event           TEXT NOT NULL,
     message         TEXT,
     duration_sec    REAL,
     payload_json    TEXT
@@ -237,16 +237,17 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     autoexit_enabled  INTEGER NOT NULL DEFAULT 1,
     kill_switch     INTEGER NOT NULL DEFAULT 0,
     exploration_mode INTEGER NOT NULL DEFAULT 1,
-    exploration_trades_target INTEGER NOT NULL DEFAULT 50
+    exploration_trades_target INTEGER NOT NULL DEFAULT 50,
+    owner_pid INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS trade_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp       TEXT NOT NULL,
-    event           TEXT NOT NULL,   -- ENTRY_EXECUTED | PARTIAL_EXIT | FULL_EXIT | RISK_REJECTED | ORDER_REQUESTED
+    event           TEXT NOT NULL,
     trade_id        INTEGER,
     ticker          TEXT,
-    actor           TEXT NOT NULL DEFAULT 'USER',  -- USER | AGENT
+    actor           TEXT NOT NULL DEFAULT 'USER',
     payload_json    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tradelog_at ON trade_log(timestamp);
@@ -255,7 +256,7 @@ CREATE TABLE IF NOT EXISTS data_quality_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp       TEXT NOT NULL,
     ticker          TEXT,
-    severity        TEXT,        -- INFO | WARN | ERROR
+    severity        TEXT,
     issue           TEXT,
     detail_json     TEXT
 );
@@ -284,18 +285,18 @@ CREATE TABLE IF NOT EXISTS live_trigger_config (
     telegram_enabled         INTEGER NOT NULL DEFAULT 1,
     email_enabled            INTEGER NOT NULL DEFAULT 0,
     email_recipients         TEXT    NOT NULL DEFAULT '',
-    actor_filter             TEXT    NOT NULL DEFAULT 'AGENT',  -- AGENT | BOTH
+    actor_filter             TEXT    NOT NULL DEFAULT 'AGENT',
     updated_at               TEXT
 );
 
 CREATE TABLE IF NOT EXISTS alert_log (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp      TEXT NOT NULL,
-    event_type     TEXT NOT NULL,   -- ENTRY | FULL_EXIT | STOP_LOSS | TRAILING_STOP | PARTIAL_EXIT
+    event_type     TEXT NOT NULL,
     trade_id       INTEGER,
     ticker         TEXT,
-    channel        TEXT,             -- TELEGRAM | EMAIL | DASHBOARD
-    status         TEXT,             -- SENT | FAILED | DEDUPED | SKIPPED_FILTER
+    channel        TEXT,
+    status         TEXT,
     message        TEXT,
     error          TEXT,
     payload_json   TEXT
@@ -309,10 +310,11 @@ def init_db():
     """Create tables if missing, run column migrations, and seed singleton rows."""
     with connect() as c:
         c.executescript(SCHEMA)
-        # ---- Lightweight column migrations (v2 → v3) ----
+        # ---- Lightweight column migrations (v2 → v3 → v3.1) ----
         for sql in (
             "ALTER TABLE scheduler_state ADD COLUMN exploration_mode INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE scheduler_state ADD COLUMN exploration_trades_target INTEGER NOT NULL DEFAULT 50",
+            "ALTER TABLE scheduler_state ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE trades ADD COLUMN executed_in_window TEXT",
         ):
             try:
@@ -333,7 +335,7 @@ def init_db():
             "VALUES (1, 20000.0, 20000.0, 20000.0, ?)",
             (myt_iso(),),
         )
-        # Seed parameters from on-disk JSON if exists
+        # Seed parameters
         param_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "ai_parameters.json"
         )
@@ -365,7 +367,7 @@ def init_db():
             "INSERT OR IGNORE INTO bias_state (id, payload, updated_at) VALUES (1, ?, ?)",
             (json.dumps(default_bias), myt_iso()),
         )
-        # v3.1: seed live trigger config (disabled by default — user must opt in)
+        # v3.1: seed live trigger config (disabled by default)
         c.execute(
             "INSERT OR IGNORE INTO live_trigger_config "
             "(id, enabled, updated_at) VALUES (1, 0, ?)",
@@ -401,5 +403,4 @@ def executemany(sql, args_list):
 try:
     init_db()
 except Exception as e:
-    # Fall back silently — tests may run in restricted envs.
     print(f"[db] init warning: {e}")

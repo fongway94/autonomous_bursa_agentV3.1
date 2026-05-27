@@ -177,7 +177,9 @@ def _format_entry(t: dict, ss: dict) -> tuple[str, str, str]:
         f"Sector: {sector} | Regime: {regime}\n\n"
         f"Reasoning: {(t.get('entry_reasoning') or '')[:300]}"
     )
-    html = text.replace("\n", "<br>")
+    html = ("<pre style=\"font-family:monospace;font-size:13px;\">"
+            + text.replace("<", "&lt;").replace(">", "&gt;")
+            + "</pre>")
     subject = f"[BursaAI] ENTRY — {t['ticker']} (conf {conf:.0f})"
     return text, html, subject
 
@@ -208,7 +210,9 @@ def _format_exit(t: dict, event_type: str, exit_price: float,
         f"Result: {outcome} RM {pnl:+,.2f} | {pnl_pct:+.2f}% on cost\n"
         f"Held: {held} days"
     )
-    html = text.replace("\n", "<br>")
+    html = ("<pre style=\"font-family:monospace;font-size:13px;\">"
+            + text.replace("<", "&lt;").replace(">", "&gt;")
+            + "</pre>")
     subject = f"[BursaAI] {label} — {t['ticker']} ({outcome} {pnl:+,.0f})"
     return text, html, subject
 
@@ -305,7 +309,9 @@ def send_test_alert() -> dict:
         f"Time: {myt_iso()} MYT\n\n"
         "If you can see this, your alert channel is working."
     )
-    html = text.replace("\n", "<br>")
+    html = ("<pre style=\"font-family:monospace;font-size:13px;\">"
+            + text.replace("<", "&lt;").replace(">", "&gt;")
+            + "</pre>")
     channels = {
         "telegram": bool(cfg.get("telegram_enabled")),
         "email": bool(cfg.get("email_enabled")),

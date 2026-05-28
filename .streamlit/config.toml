@@ -1,0 +1,17 @@
+# Streamlit configuration — enforce LIGHT theme.
+
+[theme]
+base = "light"
+primaryColor = "#1f6feb"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f7fb"
+textColor = "#1a1a1a"
+font = "sans serif"
+
+[server]
+headless = true
+runOnSave = true
+fileWatcherType = "auto"
+
+[browser]
+gatherUsageStats = false

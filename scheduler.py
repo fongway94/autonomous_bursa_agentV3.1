@@ -152,6 +152,20 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
 
     try:
         regime = get_full_market_analysis(force_refresh=True)
+        # v3.1.4: record regime snapshot for trend analysis
+        try:
+            from repository import record_regime_snapshot
+            rd = regime.get("regime_data", {})
+            details = rd.get("details", {})
+            record_regime_snapshot(
+                regime=rd.get("regime", "UNKNOWN"),
+                conviction=rd.get("conviction", 0),
+                trend_score=details.get("trend_score"),
+                ema_200_vs_price=details.get("ema_200_vs_price"),
+                klci_rsi=details.get("klci_rsi"),
+            )
+        except Exception:
+            pass  # never block the cycle on history recording
     except Exception as e:
         regime = {"regime_data": {"regime": "UNCERTAIN"}, "position_rules": {}}
         log_scheduler_event("ERROR", f"Regime fetch failed: {e}", "ERROR")

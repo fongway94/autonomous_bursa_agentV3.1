@@ -307,11 +307,23 @@ CREATE INDEX IF NOT EXISTS idx_alert_trade ON alert_log(trade_id);
 -- v3.1.1: Idempotency guard for daily maintenance tasks
 CREATE TABLE IF NOT EXISTS maintenance_state (
     task_name      TEXT PRIMARY KEY,
-    last_ran_date  TEXT NOT NULL,
-    last_ran_at    TEXT NOT NULL,
+    last_ran_date  TEXT NOT NULL,   -- YYYY-MM-DD (MYT)
+    last_ran_at    TEXT NOT NULL,   -- full timestamp
     owner_pid      INTEGER,
     result         TEXT
 );
+
+-- v3.1.4: regime history for trend analysis in cycle explanations
+CREATE TABLE IF NOT EXISTS regime_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT NOT NULL,
+    regime          TEXT NOT NULL,
+    conviction      REAL NOT NULL,
+    trend_score     REAL,
+    ema_200_vs_price REAL,
+    klci_rsi        REAL
+);
+CREATE INDEX IF NOT EXISTS idx_regime_at ON regime_history(timestamp);
 """
 
 

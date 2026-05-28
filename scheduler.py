@@ -1244,6 +1244,100 @@ def run_once() -> dict:
     )
 
 
+def get_watchdog_status() -> dict:
+    """
+    Read-only health summary for the UI to render in the 🤖 Robo-Trader
+    tab. Cheap — one SQLite read + a few in-memory comparisons. Safe to
+    call on every Streamlit rerun.
+
+    The UI MUST go through this function rather than poking at module
+    privates (``_WATCHDOG_THREAD``, ``_ORPHANED_THREAD_IDS`` etc.) so
+    we can refactor internals without breaking the UI.
+
+    Returns a dict with stable keys (see ``test_watchdog_status_ui.py``).
+    Never raises — degrades gracefully to "best-effort" values if any
+    subsystem is unreachable. The UI must always be renderable.
+    """
+    # Defaults — guarantee shape even on total failure
+    status = {
+        "watchdog_alive": False,
+        "watchdog_thread_ident": None,
+        "cycle_in_flight": False,
+        "cycle_running_for_sec": None,
+        "cycle_started_at": None,
+        "recent_timeouts_24h": 0,
+        "recent_slow_cycles_24h": 0,
+        "recent_respawns_24h": 0,
+        "orphan_thread_count": 0,
+        "watchdog_timeout_sec": WATCHDOG_CYCLE_TIMEOUT_SEC,
+        "cycle_warn_sec": CYCLE_DURATION_WARN_SEC,
+    }
+
+    # 1. Watchdog thread liveness — module globals, no DB needed
+    try:
+        wt = _WATCHDOG_THREAD
+        if wt is not None and wt.is_alive():
+            status["watchdog_alive"] = True
+            status["watchdog_thread_ident"] = wt.ident
+    except Exception:
+        pass
+
+    # 2. Orphan registry size
+    try:
+        status["orphan_thread_count"] = len(_ORPHANED_THREAD_IDS)
+    except Exception:
+        pass
+
+    # 3. Cycle-in-flight + duration — from scheduler_state
+    try:
+        ss = get_scheduler_state()
+        stamp = ss.get("cycle_started_at")
+        if stamp:
+            status["cycle_started_at"] = stamp
+            status["cycle_in_flight"] = True
+            try:
+                started_dt = datetime.strptime(
+                    stamp, "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone(timedelta(hours=8)))
+                age = (get_myt_now() - started_dt).total_seconds()
+                status["cycle_running_for_sec"] = max(0.0, age)
+            except Exception:
+                # Bad timestamp format — leave cycle_running_for_sec None
+                pass
+    except Exception:
+        pass
+
+    # 4. Recent operational events from scheduler_log (last 24h)
+    #    Cheap one-query summary so the user sees "anything bad lately?"
+    try:
+        from logger import get_scheduler_log
+        recent = get_scheduler_log(limit=500) or []
+        cutoff = get_myt_now() - timedelta(hours=24)
+        for row in recent:
+            ts = row.get("timestamp") or ""
+            event = row.get("event") or ""
+            # Cheap-ish timestamp parse — accept the standard format
+            try:
+                rt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone(timedelta(hours=8)))
+                if rt < cutoff:
+                    continue
+            except Exception:
+                # If we can't parse, count it anyway — safer to over-report
+                pass
+            if event == "CYCLE_TIMEOUT":
+                status["recent_timeouts_24h"] += 1
+            elif event == "CYCLE_SLOW":
+                status["recent_slow_cycles_24h"] += 1
+            elif event == "WATCHDOG_RESPAWN":
+                status["recent_respawns_24h"] += 1
+    except Exception:
+        # Logger unreachable — counts stay 0, UI still renderable
+        pass
+
+    return status
+
+
 # -------------------------------------------------------------------------
 # CLI entry — `python -m scheduler`
 # -------------------------------------------------------------------------

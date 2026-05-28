@@ -301,34 +301,74 @@ def _loop(interval_sec: int, my_pid: int):
                 log_scheduler_event("CYCLE_ERROR", str(e), "ERROR",
                                     payload={"trace": tb})
 
-        # Daily maintenance window (best-effort, idempotent)
+        # ---- Daily maintenance window (TRULY idempotent, v3.1.1) ----
+        # Two layers of protection against duplicate runs:
+        #   1. Re-check owner_pid right before maintenance — ghost threads
+        #      that took over mid-iteration get evicted here too.
+        #   2. try_claim_daily_task() does an atomic SQL CAS — only one
+        #      caller (across any number of ghost threads or sibling
+        #      processes) can claim each task per MYT calendar day.
         try:
             now = get_myt_now()
-            if now.hour == 1 and now.minute < 5:
-                prune_logs(5000)
-                try:
-                    from learner import train_setup_classifier
-                    res = train_setup_classifier()
-                    if res:
+            in_maintenance_window = (now.hour == 1 and now.minute < 5)
+
+            # Layer 1: re-verify ownership before any maintenance work
+            current_owner = get_scheduler_state().get("owner_pid", 0) or 0
+            if current_owner and current_owner != my_pid:
+                pass  # not our turn — skip maintenance entirely
+            elif in_maintenance_window:
+                from repository import (
+                    try_claim_daily_task, record_daily_task_result,
+                )
+
+                # 1. Log pruning (claim before doing work)
+                if try_claim_daily_task("prune_logs", my_pid):
+                    prune_logs(5000)
+                    record_daily_task_result("prune_logs", "ok")
+
+                # 2. ML classifier nightly retrain — THIS is the one that
+                #    was firing 8× per night before the idempotency guard.
+                if try_claim_daily_task("ml_retrain", my_pid):
+                    try:
+                        from learner import train_setup_classifier
+                        res = train_setup_classifier()
+                        if res:
+                            log_scheduler_event(
+                                "NIGHTLY_RETRAIN",
+                                f"ML classifier retrained, OOS acc={res[1]:.3f} "
+                                f"(PID {my_pid})")
+                            record_daily_task_result(
+                                "ml_retrain", f"oos_acc={res[1]:.4f}")
+                        else:
+                            record_daily_task_result(
+                                "ml_retrain", "no_result")
+                    except Exception as e:
                         log_scheduler_event(
-                            "NIGHTLY_RETRAIN",
-                            f"ML classifier retrained, OOS acc={res[1]:.3f}")
-                except Exception as e:
-                    log_scheduler_event(
-                        "NIGHTLY_RETRAIN", f"failed: {e}", "ERROR")
+                            "NIGHTLY_RETRAIN", f"failed: {e}", "ERROR")
+                        record_daily_task_result(
+                            "ml_retrain", f"error: {e}")
+
+            # 3. Exploration auto-disable — also idempotent, but checked
+            #    every iteration (not just during maintenance window) so
+            #    the switch can happen the moment the threshold is hit.
             from repository import closed_trades
             ss = get_scheduler_state()
             if ss.get("exploration_mode"):
                 tgt = ss.get("exploration_trades_target", 50) or 50
                 done = len(closed_trades())
                 if done >= tgt:
-                    update_scheduler_state(exploration_mode=0)
-                    log_scheduler_event(
-                        "EXPLORATION_END",
-                        f"Closed {done} trades — switching to "
-                        "exploitation (LCB) mode", "INFO")
-        except Exception:
-            pass
+                    # CAS update: only one writer flips the flag and logs.
+                    if try_claim_daily_task("exploration_end", my_pid):
+                        update_scheduler_state(exploration_mode=0)
+                        log_scheduler_event(
+                            "EXPLORATION_END",
+                            f"Closed {done} trades — switching to "
+                            "exploitation (LCB) mode", "INFO")
+                        record_daily_task_result(
+                            "exploration_end", f"flipped_at_{done}_trades")
+        except Exception as e:
+            log_scheduler_event(
+                "MAINTENANCE_ERROR", f"{e}", "ERROR")
 
         # Sleep until next scheduled time, but allow early wake on stop
         nxt = _next_run_at(interval_sec)

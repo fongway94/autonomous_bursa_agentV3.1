@@ -185,8 +185,24 @@ def _explain_cycle_outcome(summary: dict, df, regime: dict,
 # Single cycle
 # -------------------------------------------------------------------------
 
-def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
+def _run_one_cycle(autotrade: bool, autoexit: bool,
+                     my_pid: int | None = None) -> dict:
     """One full scan + settle cycle. Returns summary dict."""
+    # v3.1.9: ownership check at the very top — if another thread has
+    # claimed the scheduler while we were mid-cycle, abort immediately.
+    if my_pid is not None:
+        state = get_scheduler_state()
+        current_owner = state.get("owner_pid", 0) or 0
+        if current_owner and current_owner != my_pid:
+            log_scheduler_event(
+                "CYCLE_ABORT",
+                f"PID {my_pid} aborting cycle — owner_pid now {current_owner}",
+                "WARN",
+            )
+            return {"scan_count": 0, "settled": 0, "partials": 0,
+                    "auto_entries": 0, "rejected": 0, "errors": [],
+                    "aborted": True}
+
     from screener import screen_all_stocks
     from market_analyzer import get_full_market_analysis
     from trading_engine import auto_settle_trades, execute_entry
@@ -522,7 +538,10 @@ def _loop(interval_sec: int, my_pid: int):
                 autotrade = bool(state.get("autotrade_enabled", 1))  # v3 default ON
                 autoexit = bool(state.get("autoexit_enabled", 1))
                 t0 = time.time()
-                summary = _run_one_cycle(autotrade=autotrade, autoexit=autoexit)
+                # v3.1.9: pass my_pid so _run_one_cycle can abort if ownership
+                # changed while it was sleeping.
+                summary = _run_one_cycle(autotrade=autotrade, autoexit=autoexit,
+                                          my_pid=my_pid)
                 duration = time.time() - t0
                 update_scheduler_state(
                     last_run_at=myt_iso(),
@@ -634,6 +653,10 @@ def start(interval_sec: int = 3600) -> bool:
     Sets owner_pid to our process ID. Any older ghost loop (from a
     previous Streamlit Cloud deploy) will detect the PID change on
     its next iteration and exit cleanly.
+
+    v3.1.9: Guard 2 now uses DB `running` flag as the source of truth.
+    A zombie thread that hasn't finished its cycle yet (after stop())
+    no longer permanently blocks start().
     """
     global _THREAD
     with _LOCK:
@@ -642,15 +665,29 @@ def start(interval_sec: int = 3600) -> bool:
             return False
 
         my_pid = os.getpid()
+        state = get_scheduler_state()
+        db_running = bool(state.get("running", 0))
+        db_owner = state.get("owner_pid", 0) or 0
 
         # Guard 2: threading.enumerate() scan for any alive "bursa-scheduler"
-        # (catches lost-reference threads where _THREAD handle was reset)
+        # Only treat it as a blocker if the DB ALSO says running=1 and the
+        # owner matches us. If DB says stopped (running=0), any alive thread
+        # is a zombie finishing its last cycle — don't block forever.
         for t in threading.enumerate():
             if getattr(t, "name", None) == "bursa-scheduler" and t.is_alive():
-                return False
+                if db_running and db_owner == my_pid:
+                    return False
+                # Zombie thread from a previous stop/start cycle.
+                # Log and proceed — the new owner_pid will evict it.
+                log_scheduler_event(
+                    "ZOMBIE_SKIP",
+                    f"Alive thread found but DB says running={int(db_running)} "
+                    f"owner={db_owner} — starting new thread anyway",
+                    "WARN",
+                )
+                break
 
         # Guard 3: DB heartbeat freshness for this PID
-        state = get_scheduler_state()
         if (state.get("running") == 1 and state.get("owner_pid") == my_pid):
             hb = state.get("last_heartbeat")
             if hb:
@@ -700,10 +737,9 @@ def stop() -> None:
     global _THREAD
     with _LOCK:
         _STOP_EVENT.set()
-        # v3.1.8: also set running=0 so that start() / ensure_started()
-        # can immediately respawn after an intentional stop, rather than
-        # being blocked by the DB-based same-process guard.
-        update_scheduler_state(kill_switch=1, running=0)
+        # v3.1.9: clear owner_pid so start() knows this is a true stop.
+        # Also set running=0 so Guard 2 in start() won't block on zombies.
+        update_scheduler_state(kill_switch=1, running=0, owner_pid=0)
         if _THREAD is not None:
             _THREAD.join(timeout=5)
         _THREAD = None
@@ -722,7 +758,7 @@ def force_restart(interval_sec: int = 3600) -> None:
     # v3.1.9: poll briefly for the old thread to actually die.
     # join(timeout=5) is too short if the thread is mid-scan (~100s).
     # Without this, start()'s Guard 2 sees the old thread and returns False.
-    for _ in range(25):
+    for _ in range(150):   # 30 seconds total (150 × 0.2s)
         if not any(getattr(t, "name", None) == "bursa-scheduler" and t.is_alive()
                    for t in threading.enumerate()):
             break
@@ -746,6 +782,10 @@ def ensure_started(interval_sec: int = 3600,
     Streamlit re-runs the script on every interaction; daemon threads
     usually survive but can die silently if the parent process is restarted
     without killing children. The heartbeat check is the safety net.
+
+    v3.1.9: removed the Case 3 short-circuit that could return early
+    when _THREAD was lost but DB heartbeat was fresh.  That short-circuit
+    prevented self-healing after a stop/join race.
     """
     state = get_scheduler_state()
     current_owner = state.get("owner_pid", 0) or 0
@@ -769,13 +809,6 @@ def ensure_started(interval_sec: int = 3600,
     # Case 2: we own it and our local thread is alive → all good.
     if current_owner == my_pid and is_running():
         return
-
-    # v3.1.8: DB indicates a live same-process owner but _THREAD handle
-    # was lost (Streamlit module reload, stop/join race, etc.).  start()
-    # will reject too, but short-circuit here to avoid log noise.
-    if current_owner == my_pid and not is_running():
-        if bool(state.get("running", 0)) and age is not None and age < 300:
-            return
 
     # Case 3: stale or no owner — we should take over.
     if not is_running():

@@ -23,9 +23,9 @@ Credentials
 -----------
 Requires ONE secret in Streamlit Cloud → Manage app → Secrets:
 
-  GITHUB_TOKEN = "github_pat_..."
-  # Personal Access Token (fine-grained) with scope: gist (read+write).
-  # Generate at https://github.com/settings/tokens?type=beta
+  GITHUB_TOKEN = "ghp_..."
+  # Personal Access Token (CLASSIC, not fine-grained) with scope: gist.
+  # Generate at https://github.com/settings/tokens (NOT ?type=beta)
 
 The first backup will create the gist; subsequent backups update the
 same gist (we remember its ID in a tiny marker file inside the data dir,
@@ -38,6 +38,7 @@ Safety guarantees
   in UI as "❌ not configured" but app still works).
 * DB file is compressed with gzip before upload (typically 4-10x smaller).
 * gzip + base64-encoded for Gist storage (Gists store text).
+* v3.1.6: ML classifier .pkl is also backed up alongside the DB.
 """
 
 from __future__ import annotations
@@ -58,7 +59,9 @@ log = get_logger("persistence")
 MYT = timezone(timedelta(hours=8))
 GIST_API = "https://api.github.com/gists"
 GIST_FILENAME = "bursa_agent_db.b64.gz"
+ML_GIST_FILENAME = "setup_classifier.pkl.b64.gz"  # v3.1.6: ML model
 MARKER_FILE = os.path.join(DATA_DIR, ".gist_marker.json")
+ML_MODEL_PATH = os.path.join(DATA_DIR, "setup_classifier.pkl")
 
 # Avoid overlapping backups
 _BACKUP_LOCK = threading.RLock()
@@ -133,6 +136,19 @@ def _decode_gist_to_db(encoded: str, target_path: str) -> int:
     return len(raw)
 
 
+def _encode_ml_for_gist() -> str | None:
+    """
+    Encode the ML classifier .pkl for gist storage.
+    Returns None if no .pkl exists (no model to back up yet).
+    """
+    if not os.path.exists(ML_MODEL_PATH):
+        return None
+    with open(ML_MODEL_PATH, "rb") as f:
+        raw = f.read()
+    compressed = gzip.compress(raw, compresslevel=6)
+    return base64.b64encode(compressed).decode("ascii")
+
+
 # ---------------------------------------------------------------------------
 # Backup
 # ---------------------------------------------------------------------------
@@ -173,14 +189,24 @@ def backup(force: bool = False, reason: str = "") -> dict:
             marker = _read_marker()
             gist_id = marker.get("gist_id")
 
+            files = {GIST_FILENAME: {"content": encoded}}
+
+            # v3.1.6: also include the ML classifier .pkl if it exists
+            ml_encoded = _encode_ml_for_gist()
+            ml_size_kb = 0.0
+            if ml_encoded:
+                files[ML_GIST_FILENAME] = {"content": ml_encoded}
+                ml_size_kb = len(ml_encoded) / 1024
+
             payload = {
                 "description": (
                     f"BursaAI agent DB backup — "
                     f"{now.strftime('%Y-%m-%d %H:%M:%S')} MYT. "
                     f"Reason: {reason or 'periodic'}. "
-                    f"Size: {size_kb:.1f} KB (compressed)."
+                    f"DB: {size_kb:.1f} KB | ML: {ml_size_kb:.1f} KB "
+                    f"(both compressed)."
                 ),
-                "files": {GIST_FILENAME: {"content": encoded}},
+                "files": files,
             }
 
             if gist_id:
@@ -255,17 +281,20 @@ def restore(gist_id: str | None = None) -> dict:
             result["reason"] = f"gist {gist_id} has no file '{GIST_FILENAME}'"
             return result
 
-        file_meta = files[GIST_FILENAME]
-        # Truncated content — fetch raw_url
-        if file_meta.get("truncated") or not file_meta.get("content"):
-            raw_url = file_meta.get("raw_url")
-            if not raw_url:
-                result["reason"] = "truncated gist with no raw_url"
-                return result
-            r2 = requests.get(raw_url, headers=_headers(), timeout=60)
-            encoded = r2.text
-        else:
-            encoded = file_meta["content"]
+        def _fetch_file_content(file_meta):
+            """Get file content, handling truncated gists via raw_url."""
+            if file_meta.get("truncated") or not file_meta.get("content"):
+                raw_url = file_meta.get("raw_url")
+                if not raw_url:
+                    return None
+                r2 = requests.get(raw_url, headers=_headers(), timeout=60)
+                return r2.text
+            return file_meta["content"]
+
+        encoded = _fetch_file_content(files[GIST_FILENAME])
+        if encoded is None:
+            result["reason"] = "DB file truncated with no raw_url"
+            return result
 
         # SAFETY: backup the existing DB before overwriting (just in case)
         if os.path.exists(DB_PATH):
@@ -277,10 +306,26 @@ def restore(gist_id: str | None = None) -> dict:
                 pass
 
         bytes_restored = _decode_gist_to_db(encoded.strip(), DB_PATH)
+
+        # v3.1.6: also restore the ML classifier .pkl if present
+        ml_bytes = 0
+        if ML_GIST_FILENAME in files:
+            try:
+                ml_encoded = _fetch_file_content(files[ML_GIST_FILENAME])
+                if ml_encoded:
+                    ml_bytes = _decode_gist_to_db(ml_encoded.strip(),
+                                                    ML_MODEL_PATH)
+                    log.info(f"ML classifier restored ({ml_bytes} bytes)")
+            except Exception as e:
+                log.warning(f"ML classifier restore failed (non-fatal): {e}")
+
         result.update({"ok": True, "bytes_restored": bytes_restored,
+                        "ml_bytes_restored": ml_bytes,
                         "gist_id": gist_id,
-                        "reason": "restored from gist"})
-        log.info(f"restore OK ({bytes_restored} bytes) ← gist {gist_id}")
+                        "reason": (f"restored DB + ML"
+                                   if ml_bytes else "restored DB only")})
+        log.info(f"restore OK (DB={bytes_restored}, ML={ml_bytes}) "
+                  f"← gist {gist_id}")
     except Exception as e:
         result["reason"] = f"exception: {e}"
         log.error(f"restore exception: {e}")

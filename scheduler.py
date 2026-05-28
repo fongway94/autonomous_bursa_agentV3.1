@@ -456,6 +456,7 @@ def _loop(interval_sec: int, my_pid: int):
             # Is the current owner still alive? Check their heartbeat freshness.
             other_hb = state.get("last_heartbeat")
             other_is_alive = False
+            age_sec = None
             if other_hb:
                 try:
                     other_dt = datetime.strptime(other_hb, "%Y-%m-%d %H:%M:%S")
@@ -479,7 +480,8 @@ def _loop(interval_sec: int, my_pid: int):
             log_scheduler_event(
                 "OWNER_TAKEOVER",
                 f"PID {my_pid} taking over from stale owner "
-                f"PID {current_owner} (no beat for {age_sec:.0f}s)", "WARN")
+                f"PID {current_owner} (no beat for "
+                f"{age_sec if age_sec is not None else '?'}s)", "WARN")
 
         # HEARTBEAT — always update next_run_at on every wake-up
         # so the UI shows the correct upcoming sleep target, regardless
@@ -695,15 +697,18 @@ def ensure_started(interval_sec: int = 3600,
     """
     Idempotent + self-healing.
 
-    1. If not running → start.
-    2. If running but heartbeat is older than 2× interval → force-restart.
+    v3.1.8: be conservative — don't spawn duplicate loops.
+    If another process is the owner and beat recently, do NOTHING.
+
+    1. If another live owner exists → do nothing.
+    2. If we own it and our local thread is alive → do nothing.
+    3. If stale/no owner → start.
+    4. If our local thread is a ghost (DB shows other owner) → force-restart.
 
     Streamlit re-runs the script on every interaction; daemon threads
     usually survive but can die silently if the parent process is restarted
     without killing children. The heartbeat check is the safety net.
     """
-    # v3.1.8: be conservative — don't spawn duplicate loops.
-    # If another process is the owner and beat recently, do NOTHING.
     state = get_scheduler_state()
     current_owner = state.get("owner_pid", 0) or 0
     hb = state.get("last_heartbeat")

@@ -13,44 +13,45 @@ import time
 from datetime import datetime, timezone, timedelta
 
 
-def test_ensure_started_does_not_spawn_when_other_owner_alive(monkeypatch):
+def test_ensure_started_evicts_stale_owner_from_dead_container(monkeypatch):
     """
-    If another process is the registered owner and its heartbeat is
-    recent (<5 min), ensure_started must do NOTHING — no new thread,
-    no force_restart.
+    v3.2: if another PID is the registered owner (even with a fresh
+    heartbeat), ensure_started starts the scheduler anyway — on
+    Streamlit Cloud, the 'other owner' is always a dead container.
     """
     import scheduler
-    from repository import update_scheduler_state
+    from repository import update_scheduler_state, get_scheduler_state
     from db import myt_iso, get_myt_now
 
-    # Stub heavy work
     monkeypatch.setattr(scheduler, "_run_one_cycle",
                         lambda *a, **k: {"scan_count": 0, "settled": 0,
                                           "partials": 0, "auto_entries": 0,
                                           "rejected": 0, "errors": []})
     monkeypatch.setattr(scheduler, "_is_market_hours", lambda: False)
 
-    # Make sure no local thread is running
     scheduler._STOP_EVENT.set()
     if scheduler._THREAD is not None:
         scheduler._THREAD.join(timeout=2)
     scheduler._THREAD = None
     scheduler._STOP_EVENT.clear()
 
-    # Simulate another live owner with a fresh heartbeat (5 sec ago)
     fake_other_pid = 99999
     fake_recent_hb = myt_iso(get_myt_now() - timedelta(seconds=5))
     update_scheduler_state(owner_pid=fake_other_pid,
                             last_heartbeat=fake_recent_hb,
                             running=1, kill_switch=0)
 
-    # ensure_started should NOT spawn a thread
     scheduler.ensure_started(interval_sec=60)
+    import time; time.sleep(0.3)
 
-    # Verify no local thread was created
-    assert scheduler._THREAD is None or not scheduler._THREAD.is_alive(), \
-        "ensure_started must NOT spawn a thread when another live owner exists"
+    assert scheduler._THREAD is not None and scheduler._THREAD.is_alive(), \
+        "v3.2: ensure_started must start even when another owner has fresh heartbeat"
 
+    state = get_scheduler_state()
+    assert state["owner_pid"] == os.getpid()
+    assert state["running"] == 1
+
+    scheduler.stop()
 
 def test_ensure_started_takes_over_when_owner_is_stale(monkeypatch):
     """If the registered owner hasn't beat in >5 min, we can take over."""

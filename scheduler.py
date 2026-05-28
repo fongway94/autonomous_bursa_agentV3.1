@@ -97,7 +97,6 @@ def _explain_cycle_outcome(summary: dict, df, regime: dict,
                 "no breakout or pullback setups today.")
 
     # 4. Above-threshold qualifiers
-        # 4. Above-threshold qualifiers
     qualifiers = gold_buys_all[gold_buys_all["confidence"] >= threshold]
     if len(qualifiers) == 0:
         best_conf = float(gold_buys_all["confidence"].max())

@@ -215,8 +215,11 @@ except Exception as e:
 # (from the ghost-thread bug). Cheap, idempotent, runs once per session.
 if "log_deduped" not in st.session_state:
     try:
-        from logger import dedupe_scheduler_log_at_same_second
+        from logger import (dedupe_scheduler_log_at_same_second,
+                            dedupe_scheduler_log_within_minute)
         dedupe_scheduler_log_at_same_second()
+        # v3.1.8: also collapse HEARTBEAT/SKIP storms within same minute
+        dedupe_scheduler_log_within_minute()
     except Exception:
         pass
     st.session_state["log_deduped"] = True

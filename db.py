@@ -303,6 +303,15 @@ CREATE TABLE IF NOT EXISTS alert_log (
 );
 CREATE INDEX IF NOT EXISTS idx_alert_at ON alert_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_alert_trade ON alert_log(trade_id);
+
+-- v3.1.1: Idempotency guard for daily maintenance tasks
+CREATE TABLE IF NOT EXISTS maintenance_state (
+    task_name      TEXT PRIMARY KEY,
+    last_ran_date  TEXT NOT NULL,
+    last_ran_at    TEXT NOT NULL,
+    owner_pid      INTEGER,
+    result         TEXT
+);
 """
 
 

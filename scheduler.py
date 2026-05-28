@@ -252,6 +252,15 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
                         learn_from_trade_outcome(t)
                     except Exception as e:
                         log.error(f"learning failed for trade {t['id']}: {e}")
+            # v3.1.5: backup immediately after any closed trades —
+            # preserves brain learning + new account balance
+            if settle_res.get("settled"):
+                try:
+                    from persistence import backup as _pers_backup, is_configured
+                    if is_configured():
+                        _pers_backup(reason=f"{len(settle_res['settled'])} trade(s) closed")
+                except Exception:
+                    pass
         except Exception as e:
             log_scheduler_event("ERROR", f"Auto-settle failed: {e}", "ERROR")
 

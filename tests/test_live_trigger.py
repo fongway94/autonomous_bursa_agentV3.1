@@ -208,3 +208,100 @@ def test_email_returns_error_without_creds(monkeypatch):
     ok, err = send_email("s", "b", ["a@b.com"])
     assert not ok
     assert "SMTP" in err.upper() or "smtp" in err
+
+
+# ----- Telegram payload format (regression guard for v3.1 hotfix) -----
+
+def test_send_telegram_does_not_send_br_tag(monkeypatch):
+    """
+    Regression: Telegram rejects <br> when parse_mode=HTML.
+    notifier.send_telegram should default to plain text (no parse_mode)
+    so newlines work natively and <br>-style markup never reaches Telegram.
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake_token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+
+    captured = {}
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"ok": True, "result": {}}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["payload"] = json
+        return FakeResp()
+
+    import notifier
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+
+    msg = "ENTRY ALERT\nLine 2\nLine 3"
+    ok, err = notifier.send_telegram(msg)
+    assert ok, f"telegram should succeed but got: {err}"
+    # parse_mode must NOT be in payload when default plain text is used
+    assert "parse_mode" not in captured["payload"], \
+        "default send_telegram must NOT set parse_mode (was the bug)"
+    # Newlines must be preserved as-is
+    assert "\n" in captured["payload"]["text"]
+    # <br> must NOT appear anywhere
+    assert "<br>" not in captured["payload"]["text"]
+
+
+def test_dispatch_sends_plain_text_to_telegram(monkeypatch):
+    """dispatch() must pass message_text (plain) to telegram, not message_html."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake_token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+
+    captured = {}
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"ok": True}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["payload"] = json
+        return FakeResp()
+
+    import notifier
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+
+    notifier.dispatch(
+        event_type="TEST",
+        message_text="Plain text body\nwith real newlines",
+        message_html="<pre>HTML body with &lt;tag&gt;</pre>",
+        subject="[test]",
+        trade_id=None, ticker=None,
+        channels={"telegram": True, "email": False, "dashboard": True},
+        recipients=[], payload={},
+    )
+
+    sent = captured["payload"]["text"]
+    assert "Plain text body" in sent
+    assert "<pre>" not in sent
+    assert "&lt;" not in sent
+
+
+def test_telegram_truncates_long_messages(monkeypatch):
+    """Telegram has a 4096-char hard limit; we must truncate safely."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake_token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+
+    captured = {}
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"ok": True}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["payload"] = json
+        return FakeResp()
+
+    import notifier
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+
+    huge = "X" * 5000
+    ok, err = notifier.send_telegram(huge)
+    assert ok
+    assert len(captured["payload"]["text"]) <= 4096

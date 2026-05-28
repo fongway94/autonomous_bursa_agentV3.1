@@ -335,6 +335,21 @@ def restore(gist_id: str | None = None) -> dict:
 
         bytes_restored = _decode_gist_to_db(encoded.strip(), DB_PATH)
 
+        # v3.1.13: re-apply schema migrations after restore.
+        # Critical for forward-compat: the Gist backup may have been made
+        # before a column was added (e.g. cycle_started_at in v3.1.10).
+        # Without this, the restored DB has stale schema and the next
+        # write to a new column crashes with sqlite3.OperationalError.
+        # init_db() is idempotent — safe to call.
+        try:
+            from db import init_db as _init_db_after_restore
+            _init_db_after_restore()
+            log.info("post-restore init_db() ran — pending migrations applied")
+        except Exception as _mig_err:
+            # Don't fail the whole restore over a migration glitch —
+            # the restore itself succeeded. Log and continue.
+            log.error(f"post-restore init_db failed: {_mig_err}")
+
         # v3.1.6: also restore the ML classifier .pkl if present
         ml_bytes = 0
         if ML_GIST_FILENAME in files:

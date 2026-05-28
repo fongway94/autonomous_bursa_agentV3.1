@@ -169,6 +169,7 @@ notifier → Telegram + Email (when live_trigger fires)
 - **Question infrastructure assumptions early** — the v3.1.5 Gist persistence should have been v2 day-one. For any long-running system, always ask "where does the data live and what kills it?" BEFORE building learning features on top.
 
 ### Files I deploy to (in repo root)
+```
 app.py
 scheduler.py
 screener.py
@@ -204,6 +205,7 @@ LIVE_TRIGGER_GUIDE.md
 CHANGES_V2_TO_V3.md
 CHANGES_V3_TO_V3_1.md
 AI_CHAT_HANDOFF.md (this file)
+```
 
 ### Streamlit Cloud Secrets I have configured
 - `GITHUB_TOKEN` — classic PAT with `gist` scope (v3.1.5 persistence)

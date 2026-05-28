@@ -287,3 +287,55 @@ def update_scheduler_state(**fields) -> None:
     args = tuple(fields.values())
     with connect() as c:
         c.execute(f"UPDATE scheduler_state SET {set_clause} WHERE id=1", args)
+
+# =========================================================================
+# DAILY MAINTENANCE IDEMPOTENCY (v3.1.1)
+# =========================================================================
+
+def try_claim_daily_task(task_name: str, owner_pid: int | None = None) -> bool:
+    """
+    Atomically claim a daily maintenance task for today (MYT date).
+
+    Returns True if this caller is the first to claim it today —
+    in which case they should proceed to run the task.
+    Returns False if any other caller has already claimed it today
+    (within this process or any ghost thread/sibling process).
+
+    Uses INSERT ... ON CONFLICT DO NOTHING for atomic CAS semantics
+    on the (task_name) primary key.
+    """
+    import os
+    from datetime import datetime, timezone, timedelta
+    pid = owner_pid if owner_pid is not None else os.getpid()
+    myt_zone = timezone(timedelta(hours=8))
+    today = datetime.now(myt_zone).strftime("%Y-%m-%d")
+    now = datetime.now(myt_zone).strftime("%Y-%m-%d %H:%M:%S")
+
+    with connect() as c:
+        # Step 1: try INSERT — succeeds only if no row exists for this task
+        cur = c.execute(
+            "INSERT OR IGNORE INTO maintenance_state "
+            "(task_name, last_ran_date, last_ran_at, owner_pid) "
+            "VALUES (?, ?, ?, ?)",
+            (task_name, today, now, pid),
+        )
+        if cur.rowcount == 1:
+            return True  # we just inserted — we own today's run
+
+        # Step 2: row exists; CAS update from yesterday → today
+        cur = c.execute(
+            "UPDATE maintenance_state "
+            "SET last_ran_date=?, last_ran_at=?, owner_pid=? "
+            "WHERE task_name=? AND last_ran_date < ?",
+            (today, now, pid, task_name, today),
+        )
+        return cur.rowcount == 1
+
+
+def record_daily_task_result(task_name: str, result: str) -> None:
+    """Optional: store the outcome of a daily task for inspection."""
+    with connect() as c:
+        c.execute(
+            "UPDATE maintenance_state SET result=? WHERE task_name=?",
+            (result, task_name),
+        )

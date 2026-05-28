@@ -152,21 +152,6 @@ def load_custom_watchlist_tickers() -> dict:
     return {r["ticker"]: {"name": r["name"], "sector": r["sector"]} for r in rows}
 
 
-def save_custom_watchlist_tickers(custom_tickers: dict) -> bool:
-    # Reset and reinsert (used for bulk overrides)
-    with connect() as c:
-        c.execute("DELETE FROM custom_watchlist")
-        for ticker, v in (custom_tickers or {}).items():
-            if isinstance(v, dict):
-                c.execute(
-                    "INSERT INTO custom_watchlist (ticker, name, sector, added_at) "
-                    "VALUES (?,?,?,?)",
-                    (ticker, v.get("name", ticker), v.get("sector", "Custom"),
-                     myt_iso()),
-                )
-    return True
-
-
 def add_custom_ticker(ticker: str, name: str, sector: str = "Custom") -> str:
     ticker = ticker.strip().upper()
     if not ticker.endswith(".KL"):

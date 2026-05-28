@@ -1432,6 +1432,47 @@ with tab_settings:
             save_risk_params(new_rp)
             st.success("Saved."); st.rerun()
 
+    # v3.1.7: Long-term maintenance status panel
+    st.markdown("### 🗓️ Long-Term Maintenance Status")
+    st.caption(
+        "The agent runs indefinitely, but a few items need periodic human "
+        "attention. Items in red/yellow above the tabs need action NOW. "
+        "Items below show current status of each."
+    )
+    try:
+        from maintenance_reminders import get_all_reminder_states
+        _all = get_all_reminder_states()
+        for _item in _all:
+            _state = _item.get("state", "ok")
+            _id = _item.get("id", "?")
+            _icon = {"ok": "✅", "due": "📢", "overdue": "🚨"}.get(_state, "❓")
+            _label = {
+                "holidays": "Public holiday list",
+                "github_token": "GitHub PAT (backup)",
+                "walk_forward": "Walk-forward optimization",
+            }.get(_id, _id)
+            if _state == "ok":
+                # Show ok state with details if available
+                _detail = ""
+                if _id == "github_token" and "days_since" in _item:
+                    _detail = (f" — token in use for "
+                               f"{_item['days_since']} days, "
+                               f"warning in {_item.get('days_until_warning', '?')} days")
+                elif _id == "walk_forward" and "days_since_last" in _item:
+                    _detail = (f" — last run "
+                               f"{_item['days_since_last']} days ago")
+                elif _id == "walk_forward" and "reason" in _item:
+                    _detail = f" — {_item['reason']}"
+                elif _id == "holidays":
+                    _detail = " — current year covered"
+                st.success(f"{_icon} **{_label}**{_detail}")
+            elif _state == "due":
+                st.warning(f"{_icon} **{_label}** — {_item.get('deadline','due soon')}")
+            elif _state == "overdue":
+                st.error(f"{_icon} **{_label}** — OVERDUE: {_item.get('deadline','—')}")
+    except Exception as _e:
+        st.caption(f"(maintenance reminders unavailable: {_e})")
+
     st.markdown("### Custom Watchlist")
     custom = load_custom_watchlist_tickers()
     if custom:

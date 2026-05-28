@@ -452,6 +452,19 @@ def _loop(interval_sec: int, my_pid: int):
         )
         log_scheduler_event("HEARTBEAT", f"alive (PID {my_pid})")
 
+        # v3.1.5: hourly DB backup safety net (only if GITHUB_TOKEN configured)
+        try:
+            from persistence import backup as _pers_backup, is_configured
+            if is_configured():
+                res = _pers_backup(reason="hourly heartbeat")
+                if not res.get("ok") and not res.get("skipped"):
+                    log_scheduler_event(
+                        "BACKUP_FAIL",
+                        f"Hourly backup failed: {res.get('reason','?')}",
+                        "WARN")
+        except Exception:
+            pass
+
         # Check market hours
         if not _is_market_hours():
             from risk_manager import check_trading_time_window

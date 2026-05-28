@@ -180,6 +180,30 @@ if "boot_restore_attempted" not in st.session_state:
         st.warning(f"Backup restore skipped: {e}")
     st.session_state["boot_restore_attempted"] = True
 
+# v3.1.6: ML classifier auto-train on first boot if missing.
+# Without this, the .pkl file was only being built at 01:00 MYT during
+# nightly maintenance — meaning users who never had a container alive
+# at midnight saw "Classifier not trained yet" indefinitely.
+if "ml_classifier_checked" not in st.session_state:
+    try:
+        import os
+        from db import DATA_DIR
+        _clf_path = os.path.join(DATA_DIR, "setup_classifier.pkl")
+        if not os.path.exists(_clf_path):
+            # Train in a background thread so it doesn't block app boot
+            import threading
+            def _bg_train():
+                try:
+                    from learner import train_setup_classifier
+                    train_setup_classifier()
+                except Exception as e:
+                    print(f"[boot] ML auto-train failed: {e}")
+            threading.Thread(target=_bg_train, daemon=True,
+                              name="ml-boot-train").start()
+    except Exception:
+        pass
+    st.session_state["ml_classifier_checked"] = True
+
 # v3: call ensure_started on EVERY rerun — it's now self-healing
 # (will force-restart if the heartbeat is stale).
 try:

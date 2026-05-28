@@ -16,14 +16,9 @@ Tabs
 7. ⚙️ Settings      — risk params, scanner params, capital reset, data mgmt
 """
 
-import os
-import sys
 import json
-import time
-from datetime import datetime, timezone, timedelta
 
 import pandas as pd
-import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -31,7 +26,7 @@ from plotly.subplots import make_subplots
 
 # Local modules
 from watchlist import (
-    get_all_tickers, get_ticker_name, get_ticker_sector,
+    get_ticker_name,
     add_custom_ticker, load_custom_watchlist_tickers, remove_custom_ticker,
 )
 from screener import (
@@ -40,24 +35,21 @@ from screener import (
 from repository import (
     load_account, save_account, reset_account,
     load_parameters, save_parameters,
-    load_trades, active_trades, closed_trades,
+    load_trades, active_trades,
     get_trade, get_scheduler_state, update_scheduler_state,
     load_scan_cache, save_scan_cache,
 )
 from trading_engine import (
     execute_entry, execute_partial_exit, execute_full_exit,
     calculate_trade_cost, round_to_lot, LOT_SIZE,
-    TRANSACTION_COST_PCT,
 )
 from learner import (
     learn_from_trade_outcome, run_walk_forward_optimization,
-    train_setup_classifier, get_ml_score,
+    train_setup_classifier,
     get_strategy_performance_report, get_learning_history,
     get_classifier_meta,
 )
-from market_analyzer import (
-    get_full_market_analysis, get_market_ml_prediction,
-)
+from market_analyzer import get_full_market_analysis
 from risk_manager import (
     run_full_risk_check, get_risk_dashboard_stats,
     load_risk_params, save_risk_params,
@@ -70,7 +62,7 @@ from logger import (
 from evaluation import full_evaluation_report
 import scheduler as sched
 
-from db import get_myt_now, myt_iso
+from db import get_myt_now
 
 # =========================================================================
 # CONFIG

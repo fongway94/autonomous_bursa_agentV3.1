@@ -25,6 +25,7 @@ I'm building an autonomous AI swing-trading agent for Bursa Malaysia (KLSE). The
 **Repo location:** GitHub (originally https://github.com/fongway94/autonomous_bursa_agentV3.1)
 
 ### Architecture (high level)
+```
 Robo-Trader thread (scheduler.py, hourly, PID-owned, self-healing,
 boot-debounced so GitHub pushes don't trigger scans)
 ↓
@@ -37,6 +38,7 @@ persistence.py → GitHub Gist (private) ← restored on boot
 Streamlit dashboard (8 tabs: Scanner / Portfolio / AI Learning / Performance / Robo-Trader / Logs / Live Alerts / Settings)
 ↓
 notifier → Telegram + Email (when live_trigger fires)
+```
 
 ### Key design decisions (don't violate without asking)
 

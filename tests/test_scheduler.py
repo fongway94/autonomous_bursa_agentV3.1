@@ -250,16 +250,17 @@ def test_same_process_duplicate_start_rejected_by_db_guard(monkeypatch):
     saved_thread = scheduler._THREAD
     scheduler._THREAD = None
 
-    # 4. start() must still reject because threading.enumerate() finds the
-    #    live 'bursa-scheduler' thread (Guard 2) and DB says running=1
-    #    with fresh heartbeat from same PID (Guard 3).
-    assert scheduler.start(interval_sec=60) is False, (
-        "start() must reject when a live same-process thread exists "
-        "even if the _THREAD handle is lost"
+    # 4. v3.2: start() orphans the old thread and starts a fresh one.
+    #    This is intentional — the old thread will self-exit via
+    #    owner_pid mismatch on its next wake-up.
+    assert scheduler.start(interval_sec=60) is True, (
+        "v3.2: start() must orphan stale threads and start fresh"
     )
+    assert scheduler.is_running()
 
-    # Restore handle so cleanup works, then stop
-    scheduler._THREAD = saved_thread
+    # Old thread should be in the orphan registry
+    assert saved_thread.ident in scheduler._ORPHANED_THREAD_IDS
+
     scheduler.stop()
     assert not scheduler.is_running()
 
@@ -386,14 +387,14 @@ def test_start_adopts_alive_thread_when_handle_lost(monkeypatch):
     saved_thread = scheduler._THREAD
     scheduler._THREAD = None
 
-    # start() should adopt the alive thread and return False
+    # v3.2: start() orphans the old thread and starts a fresh one.
     result = scheduler.start(interval_sec=60)
-    assert result is False, "start() should adopt and not duplicate"
-    assert scheduler._THREAD is saved_thread, (
-        "start() did not adopt the alive thread into _THREAD handle"
+    assert result is True, "v3.2: start() must orphan old and start fresh"
+    assert scheduler._THREAD is not saved_thread, (
+        "v3.2: start() must create a NEW thread, not adopt the old one"
     )
+    assert saved_thread.ident in scheduler._ORPHANED_THREAD_IDS
 
-    # is_running() should now be True again
     assert scheduler.is_running()
 
     scheduler.stop()

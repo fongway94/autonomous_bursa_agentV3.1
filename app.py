@@ -776,7 +776,23 @@ with tab_learning:
             fig.update_layout(**PLOTLY_LAYOUT, height=350)
             st.plotly_chart(fig, use_container_width=True)
     else:
-        st.caption("Classifier not trained yet.")
+        # v3.1.6: actionable not-trained message
+        import os
+        from db import DATA_DIR
+        clf_path = os.path.join(DATA_DIR, "setup_classifier.pkl")
+        if os.path.exists(clf_path):
+            st.warning(
+                "⚠️ Classifier .pkl file exists but metadata is missing. "
+                "Click **🔁 Re-train ML Classifier** below to rebuild."
+            )
+        else:
+            st.info(
+                "🤖 Classifier not trained yet. The agent auto-trains on "
+                "first boot (in background — takes ~30-60s) and again "
+                "nightly at 01:00 MYT.\n\n"
+                "If you just deployed and want it now, click "
+                "**🔁 Re-train ML Classifier** below."
+            )
 
     cc1, cc2 = st.columns(2)
     if cc1.button("🔁 Re-train ML Classifier", use_container_width=True):

@@ -20,8 +20,8 @@ If the user wants a real production setup, they can run
 `python -m scheduler --daemon` from cron / Task Scheduler — the same
 loop code is reused.
 
-v3.1.10 — Zombie thread recovery + cycle watchdog
--------------------------------------------------
+v3.1.10 — Zombie thread recovery
+--------------------------------
 Earlier guards in v3.1.8/3.1.9 were over-conservative: when a loop
 got stuck inside a long network call (e.g. yfinance hang) or inside a
 multi-second `_STOP_EVENT.wait()` past the 5-second stop() join window,
@@ -30,37 +30,18 @@ Start click, `start()` Guard 2 would enumerate threads, find the still-
 alive zombie, ADOPT it, and return False — leaving the UI permanently
 on "🔴 STOPPED" with no path back to RUNNING.
 
-Two complementary mechanisms now defend against this:
+The fix is the `_ORPHANED_THREAD_IDS` registry:
+  * `stop()` records the dying thread's `ident` here (regardless of
+    whether the bounded join() succeeded).
+  * `start()` Guard 2 IGNORES any "bursa-scheduler" thread whose ident
+    is in this set — they are zombies en route to self-termination
+    via the existing owner_pid eviction inside `_loop`.
+  * `force_restart()` no longer blocks for 30 s waiting for the zombie
+    to die. The zombie will self-cull on its next wake-up.
 
-  A. ``_ORPHANED_THREAD_IDS`` registry (UI-recovery path)
-     * ``stop()`` records the dying thread's ``ident`` here (regardless
-       of whether the bounded join() succeeded).
-     * ``start()`` Guard 2 IGNORES any "bursa-scheduler" thread whose
-       ident is in this set — they are zombies en route to self-
-       termination via the existing owner_pid eviction inside ``_loop``.
-     * ``force_restart()`` no longer blocks for 30 s waiting for the
-       zombie to die. The zombie will self-cull on its next wake-up.
-
-  B. ``_watchdog_loop`` (autonomous-recovery path)
-     * Separate lightweight thread that wakes every 60 s.
-     * Reads ``scheduler_state.cycle_started_at``. If a cycle has been
-       running > ``WATCHDOG_CYCLE_TIMEOUT_SEC`` (default 600 = 10 min),
-       it (1) logs ``CYCLE_TIMEOUT``, (2) clears cycle_started_at,
-       (3) bumps owner_pid to a synthetic value so the stuck loop self-
-       exits on its next wake, (4) marks the stuck thread as orphaned.
-     * Next scheduled boundary spawns a fresh ``_loop`` via
-       ``ensure_started`` from the Streamlit UI rerun.
-
-The existing ``_loop`` ownership check (compares its ``my_pid`` against
-``scheduler_state.owner_pid`` on every iteration) guarantees the orphan
+The existing `_loop` ownership check (compares its `my_pid` against
+`scheduler_state.owner_pid` on every iteration) guarantees the orphan
 exits cleanly the moment it next wakes up; we do not leak threads.
-
-Python note: ``threading`` cannot forcibly interrupt blocking I/O — that
-requires OS signals which are main-thread-only. The watchdog can only
-make the system *recover* within N minutes; it cannot make the stuck
-cycle return faster. That's why each yfinance / HTTP call must have its
-own timeout (verified in screener.py, market_analyzer.py, learner.py,
-persistence.py, notifier.py, evaluation.py).
 """
 
 from __future__ import annotations
@@ -95,20 +76,6 @@ _STOP_EVENT = threading.Event()
 # in start() must skip these — adopting a dying thread is what caused
 # the "permanently STOPPED" UI bug.
 _ORPHANED_THREAD_IDS: set[int] = set()
-
-# v3.1.10: watchdog thread — separate from the scheduler loop. Detects
-# runaway cycles (e.g. yfinance/network hang) and forces a clean handoff
-# so the scheduler recovers autonomously instead of waiting for a human
-# to click Force Restart.
-_WATCHDOG_THREAD: threading.Thread | None = None
-_WATCHDOG_STOP_EVENT = threading.Event()
-
-# Tunable knobs (kept here, not in DB — these are deploy-time config
-# rather than user-facing settings).
-WATCHDOG_TICK_SEC = 60                  # how often the watchdog checks
-WATCHDOG_CYCLE_TIMEOUT_SEC = 600        # 10 min — cycle is "runaway"
-WATCHDOG_TIMEOUT_OWNER_SENTINEL = -1    # forces owner_pid mismatch
-CYCLE_DURATION_WARN_SEC = 300           # 5 min — soft warn, no action
 
 
 def _gc_orphaned_thread_ids() -> None:
@@ -492,130 +459,6 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
 
 
 # -------------------------------------------------------------------------
-# Watchdog
-# -------------------------------------------------------------------------
-
-def _watchdog_loop(my_pid: int):
-    """
-    Wakes every WATCHDOG_TICK_SEC. If a cycle has been running longer than
-    WATCHDOG_CYCLE_TIMEOUT_SEC, forces a clean handoff:
-
-      1. Log CYCLE_TIMEOUT with the stuck duration
-      2. Reset cycle_started_at to NULL (so we don't re-fire next tick)
-      3. Bump owner_pid to WATCHDOG_TIMEOUT_OWNER_SENTINEL so the stuck
-         loop self-exits on its next wake via the existing
-         owner_pid-mismatch check inside _loop.
-      4. Mark the stuck thread as orphaned so the next start() ignores it.
-
-    Note: Python ``threading`` cannot interrupt blocking I/O. The
-    watchdog cannot make the stuck cycle return any faster than its
-    underlying network timeouts allow — it only ensures the system
-    *recovers* within WATCHDOG_CYCLE_TIMEOUT_SEC instead of forever.
-
-    This is why per-call HTTP timeouts (yfinance ``timeout=15``,
-    requests ``timeout=30``, smtp ``timeout=...``) are non-negotiable.
-    The watchdog is the second line of defence, not the first.
-    """
-    log_scheduler_event(
-        "WATCHDOG_STARTED",
-        f"Watchdog started (PID {my_pid}, "
-        f"timeout={WATCHDOG_CYCLE_TIMEOUT_SEC}s, tick={WATCHDOG_TICK_SEC}s)",
-        "INFO",
-    )
-    while not _WATCHDOG_STOP_EVENT.is_set():
-        try:
-            state = get_scheduler_state()
-            cycle_started = state.get("cycle_started_at")
-            scheduler_owner = state.get("owner_pid", 0) or 0
-
-            # Only act if our PID still owns the scheduler — otherwise
-            # another process is in charge and its own watchdog should
-            # handle it. Avoids cross-process false positives.
-            if cycle_started and scheduler_owner == my_pid:
-                try:
-                    started_dt = datetime.strptime(
-                        cycle_started, "%Y-%m-%d %H:%M:%S"
-                    ).replace(tzinfo=timezone(timedelta(hours=8)))
-                    age = (get_myt_now() - started_dt).total_seconds()
-                except Exception:
-                    age = None
-
-                if age is not None and age > WATCHDOG_CYCLE_TIMEOUT_SEC:
-                    # Runaway cycle detected — force handoff.
-                    log_scheduler_event(
-                        "CYCLE_TIMEOUT",
-                        f"Watchdog: cycle has been running {age:.0f}s "
-                        f"(> {WATCHDOG_CYCLE_TIMEOUT_SEC}s limit). "
-                        f"Forcing handoff — the stuck loop will self-exit "
-                        f"on next wake.",
-                        "ERROR",
-                        payload={"stuck_duration_sec": age,
-                                 "owner_pid": scheduler_owner},
-                    )
-                    # Clear cycle_started_at + bump owner_pid in one write.
-                    # Setting last_error gives the user something visible
-                    # in the Robo-Trader tab.
-                    update_scheduler_state(
-                        cycle_started_at=None,
-                        owner_pid=WATCHDOG_TIMEOUT_OWNER_SENTINEL,
-                        running=0,
-                        last_error=(
-                            f"Cycle exceeded {WATCHDOG_CYCLE_TIMEOUT_SEC}s "
-                            f"(ran {age:.0f}s). Watchdog forced handoff. "
-                            "Likely a yfinance / network hang."
-                        ),
-                    )
-                    # Mark the stuck scheduler thread as orphaned so
-                    # start()'s Guard 2 ignores it on the next click /
-                    # Streamlit rerun. We don't know its exact ident from
-                    # here without _LOCK, so iterate threading.enumerate.
-                    try:
-                        with _LOCK:
-                            if (_THREAD is not None
-                                    and _THREAD.is_alive()
-                                    and _THREAD.ident is not None):
-                                _ORPHANED_THREAD_IDS.add(_THREAD.ident)
-                    except Exception:
-                        pass
-        except Exception as e:
-            # The watchdog itself must never crash the process.
-            try:
-                log_scheduler_event(
-                    "WATCHDOG_ERROR", f"{e}", "ERROR")
-            except Exception:
-                pass
-
-        _WATCHDOG_STOP_EVENT.wait(timeout=WATCHDOG_TICK_SEC)
-
-
-def _start_watchdog(my_pid: int) -> None:
-    """Start the watchdog thread if not already running. Called from start()."""
-    global _WATCHDOG_THREAD
-    # Already running? Skip.
-    if (_WATCHDOG_THREAD is not None
-            and _WATCHDOG_THREAD.is_alive()):
-        return
-    _WATCHDOG_STOP_EVENT.clear()
-    _WATCHDOG_THREAD = threading.Thread(
-        target=_watchdog_loop, args=(my_pid,),
-        name="bursa-watchdog", daemon=True,
-    )
-    _WATCHDOG_THREAD.start()
-
-
-def _stop_watchdog() -> None:
-    """Signal + join the watchdog thread. Called from stop()."""
-    global _WATCHDOG_THREAD
-    _WATCHDOG_STOP_EVENT.set()
-    if _WATCHDOG_THREAD is not None:
-        try:
-            _WATCHDOG_THREAD.join(timeout=3)
-        except Exception:
-            pass
-    _WATCHDOG_THREAD = None
-
-
-# -------------------------------------------------------------------------
 # Loop
 # -------------------------------------------------------------------------
 
@@ -640,7 +483,6 @@ def _loop(interval_sec: int, my_pid: int):
         next_run_at=myt_iso(next_boundary),
         last_error="",
         owner_pid=my_pid,
-        cycle_started_at=None,   # v3.1.10: no cycle in flight yet
     )
     log_scheduler_event(
         "STARTED",
@@ -677,19 +519,14 @@ def _loop(interval_sec: int, my_pid: int):
                     other_is_alive = (age_sec < 300)
                 except Exception:
                     pass
-            # v3.1.10: also treat the watchdog sentinel as "owner changed"
-            # so a stuck loop self-exits even before a new one starts.
-            if (current_owner == WATCHDOG_TIMEOUT_OWNER_SENTINEL
-                    or other_is_alive):
-                # Live owner (or watchdog sentinel) — exit SILENTLY.
+            if other_is_alive:
+                # Live owner exists — exit SILENTLY (no log, no work).
+                # Only log ONCE per process to leave a breadcrumb.
                 if not getattr(_loop, "_silent_exit_logged", False):
                     log_scheduler_event(
                         "GHOST_EXIT",
                         f"PID {my_pid} exiting — owner PID {current_owner} "
-                        f"(beat {age_sec:.0f}s ago)" if age_sec is not None
-                        else f"PID {my_pid} exiting — owner_pid changed "
-                             f"to {current_owner}",
-                        "WARN")
+                        f"alive (last beat {age_sec:.0f}s ago)", "WARN")
                     setattr(_loop, "_silent_exit_logged", True)
                 break
             # Otherwise, the previous owner appears dead — take over silently.
@@ -738,56 +575,28 @@ def _loop(interval_sec: int, my_pid: int):
                 autotrade = bool(state.get("autotrade_enabled", 1))  # v3 default ON
                 autoexit = bool(state.get("autoexit_enabled", 1))
                 t0 = time.time()
-                # v3.1.10: stamp cycle_started_at so the watchdog can see
-                # if we get stuck. Cleared in the finally block.
-                update_scheduler_state(cycle_started_at=myt_iso())
-                try:
-                    # v3.1.9: pass my_pid so _run_one_cycle can abort if
-                    # ownership changed while it was sleeping.
-                    summary = _run_one_cycle(autotrade=autotrade,
-                                              autoexit=autoexit,
-                                              my_pid=my_pid)
-                    duration = time.time() - t0
-                    update_scheduler_state(
-                        last_run_at=myt_iso(),
-                        next_run_at=myt_iso(_next_run_at(interval_sec)),
-                        consecutive_failures=0,
-                        last_error="",
-                        cycle_started_at=None,
-                    )
-                    # v3.1.10: soft-warn on slow cycles even if they
-                    # complete. Gives you visibility before the watchdog
-                    # has to act.
-                    if duration > CYCLE_DURATION_WARN_SEC:
-                        log_scheduler_event(
-                            "CYCLE_SLOW",
-                            f"Cycle completed in {duration:.0f}s "
-                            f"(> {CYCLE_DURATION_WARN_SEC}s warn threshold). "
-                            "Yahoo Finance may be degraded — monitor for "
-                            "CYCLE_TIMEOUT events.",
-                            "WARN",
-                            duration_sec=duration,
-                        )
-                    log_scheduler_event(
-                        "CYCLE_OK",
-                        f"scan={summary['scan_count']} settled={summary['settled']} "
-                        f"partials={summary['partials']} entries={summary['auto_entries']}",
-                        duration_sec=duration, payload=summary,
-                    )
-                finally:
-                    # Defensive: clear cycle_started_at even on uncaught
-                    # exceptions so the watchdog doesn't latch on the
-                    # stamp from a cycle that already errored out.
-                    try:
-                        update_scheduler_state(cycle_started_at=None)
-                    except Exception:
-                        pass
+                # v3.1.9: pass my_pid so _run_one_cycle can abort if ownership
+                # changed while it was sleeping.
+                summary = _run_one_cycle(autotrade=autotrade, autoexit=autoexit,
+                                          my_pid=my_pid)
+                duration = time.time() - t0
+                update_scheduler_state(
+                    last_run_at=myt_iso(),
+                    next_run_at=myt_iso(_next_run_at(interval_sec)),
+                    consecutive_failures=0,
+                    last_error="",
+                )
+                log_scheduler_event(
+                    "CYCLE_OK",
+                    f"scan={summary['scan_count']} settled={summary['settled']} "
+                    f"partials={summary['partials']} entries={summary['auto_entries']}",
+                    duration_sec=duration, payload=summary,
+                )
             except Exception as e:
                 tb = traceback.format_exc()
                 fails = (state.get("consecutive_failures") or 0) + 1
                 update_scheduler_state(consecutive_failures=fails,
-                                       last_error=f"{e}\n{tb}",
-                                       cycle_started_at=None)
+                                       last_error=f"{e}\n{tb}")
                 log_scheduler_event("CYCLE_ERROR", str(e), "ERROR",
                                     payload={"trace": tb})
 
@@ -866,8 +675,7 @@ def _loop(interval_sec: int, my_pid: int):
         _STOP_EVENT.wait(timeout=sleep_secs)
 
     update_scheduler_state(running=0,
-                           last_heartbeat=myt_iso(),
-                           cycle_started_at=None)
+                           last_heartbeat=myt_iso())
     log_scheduler_event("STOPPED", "Robo-Trader loop exited")
 
 
@@ -913,9 +721,7 @@ def start(interval_sec: int = 3600) -> bool:
     zombies that stop() requested to exit but that are still alive
     (typically blocked in a sleep or a network call). Without this
     skip, a single stuck cycle would permanently jam the UI on
-    "🔴 STOPPED" with no way back to RUNNING. Also starts the
-    runaway-cycle watchdog so the system can self-recover even
-    without UI input.
+    "🔴 STOPPED" with no way back to RUNNING.
     """
     global _THREAD
     with _LOCK:
@@ -1028,16 +834,12 @@ def start(interval_sec: int = 3600) -> bool:
             interval_sec=interval_sec, kill_switch=0, running=1,
             owner_pid=my_pid,
             last_heartbeat=myt_iso(),
-            cycle_started_at=None,
         )
         _THREAD = threading.Thread(
             target=_loop, args=(interval_sec, my_pid),
             name="bursa-scheduler", daemon=True,
         )
         _THREAD.start()
-        # v3.1.10: start (or restart) the runaway-cycle watchdog now
-        # that we have a fresh owner_pid.
-        _start_watchdog(my_pid)
         log_scheduler_event(
             "START_OK",
             f"PID {my_pid}: scheduler thread spawned",
@@ -1054,18 +856,14 @@ def stop() -> None:
     BEFORE the bounded join() — so even if the thread is stuck inside a
     long network call and outlives the 5-second join, subsequent start()
     calls know to ignore it. This guarantees the UI can always recover
-    from STOPPED → RUNNING. Also stops the watchdog so it doesn't
-    hold a stale my_pid.
+    from STOPPED → RUNNING.
     """
     global _THREAD
     with _LOCK:
         _STOP_EVENT.set()
         # v3.1.9: clear owner_pid so start() knows this is a true stop.
         # Also set running=0 so Guard 2 in start() won't block on zombies.
-        # v3.1.10: also clear cycle_started_at so the watchdog doesn't
-        # latch onto a stamp from a cycle that was in flight.
-        update_scheduler_state(kill_switch=1, running=0, owner_pid=0,
-                               cycle_started_at=None)
+        update_scheduler_state(kill_switch=1, running=0, owner_pid=0)
         if _THREAD is not None:
             # v3.1.10: mark as orphaned BEFORE join — if join times out
             # because the thread is stuck, the orphan flag still applies.
@@ -1076,7 +874,6 @@ def stop() -> None:
                 pass
             _THREAD.join(timeout=5)
         _THREAD = None
-        _stop_watchdog()
 
 
 def is_running() -> bool:

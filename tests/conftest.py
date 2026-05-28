@@ -23,11 +23,13 @@ def _isolate_data_dir():
     tmp = tempfile.mkdtemp(prefix="bursa_test_")
     os.environ["HOME"] = tmp  # makes DATA_DIR resolve to <tmp>/.bursa_agent_data
 
-    # (Re)import in order
+    # (Re)import in order — persistence + app need fresh DATA_DIR too
     for mod_name in [
         "db", "logger", "data_quality", "repository",
         "risk_manager", "trading_engine", "learner",
         "market_analyzer", "scheduler", "watchlist", "evaluation",
+        "persistence", "notifier", "live_trigger",
+        "broker_adapter", "maintenance_reminders", "app",
     ]:
         if mod_name in sys.modules:
             importlib.reload(sys.modules[mod_name])
@@ -45,7 +47,7 @@ def _reset_db_between_tests():
                     "scheduler_log", "learning_events", "parameter_history",
                     "bias_history", "state_priors", "data_quality_log",
                     "scan_cache", "alert_log", "maintenance_state",
-                    "regime_history"):
+                    "regime_history", "meta", "custom_watchlist"):
             c.execute(f"DELETE FROM {tbl}")
         # Reset scheduler_state singleton to v3 defaults
         c.execute(
@@ -54,7 +56,8 @@ def _reset_db_between_tests():
             "next_run_at=NULL, last_heartbeat=NULL, "
             "consecutive_failures=0, last_error=NULL, "
             "autotrade_enabled=1, autoexit_enabled=1, kill_switch=0, "
-            "exploration_mode=1, exploration_trades_target=50 "
+            "exploration_mode=1, exploration_trades_target=50, "
+            "owner_pid=0 "
             "WHERE id=1"
         )
         # Reset live_trigger_config singleton

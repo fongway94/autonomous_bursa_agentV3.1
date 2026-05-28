@@ -134,12 +134,18 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
 
     # ---- Auto-entry on best GOLD BUYs (only if enabled) ----
     if autotrade and not df.empty:
-        now = get_myt_now()
-        entry_cutoff = now.replace(hour=16, minute=0, second=0, microsecond=0)
-        if now > entry_cutoff:
+        # Robo-only entry window: use the calendar's safe-entry rule
+        # (09:00-12:30 morning + 14:30-16:00 afternoon). Blocks new
+        # entries in lunch break and in the last hour before close.
+        from market_calendar import is_safe_entry_window, current_session
+        if not is_safe_entry_window():
+            sess = current_session()
+            sess_name = sess.name if sess else "outside-session"
             log_scheduler_event(
                 "AUTO_ENTRY_SKIP",
-                f"Inside robo no-entry window (after 16:00 MYT)", "INFO")
+                f"Outside safe-entry window (in {sess_name}). "
+                "New entries blocked.",
+                "INFO")
             return summary
         from repository import load_trades
         log_scheduler_event("AUTO_ENTRY_START", "Evaluating new entries")

@@ -175,24 +175,61 @@ def check_daily_trade_limit(trades: list) -> dict:
 
 
 def check_trading_time_window() -> dict:
+    """
+    Delegate to market_calendar for accurate Bursa session handling.
+
+    Returns the same {allowed, reason, window} dict shape as before
+    (for backwards compatibility with existing callers in scheduler.py
+    and app.py), but now honours:
+      * Real Bursa sessions (09:00-12:30, 14:30-17:00)
+      * Lunch break (12:30-14:00) blocks scans
+      * Public holidays (Hari Raya, Wesak, Deepavali, etc.)
+      * Safe-entry cutoff at 16:00 for new auto-entries
+
+    User-tunable `no_entry_before_time` / `no_entry_after_time` in
+    risk_params are honoured as ADDITIONAL constraints — they can
+    only tighten the window, not extend it past Bursa hours.
+    """
+    from market_calendar import (
+        is_market_open, is_safe_entry_window, market_status_text,
+        current_session,
+    )
     p = load_risk_params()
     now = get_myt_now()
     t = now.strftime("%H:%M")
-    if now.weekday() >= 5:
-        return {"allowed": False, "reason": "Weekend — Bursa closed.",
-                "window": "Weekend"}
-    if t < p["no_entry_before_time"]:
+
+    status = market_status_text(now)
+
+    if not is_market_open(now):
         return {"allowed": False,
-                "reason": f"Pre-market — opens {p['no_entry_before_time']} MYT.",
-                "window": f"Before {p['no_entry_before_time']}"}
-    if t > p["no_entry_after_time"]:
+                "reason": status["reason"] + f" (next: {status['next_event']})",
+                "window": status["session"]}
+
+    # Market is open. Now apply the user's optional tighter window
+    user_min = p.get("no_entry_before_time", "09:00")
+    user_max = p.get("no_entry_after_time", "17:00")
+    if t < user_min:
         return {"allowed": False,
-                "reason": f"After-market — closed at {p['no_entry_after_time']} MYT.",
-                "window": f"After {p['no_entry_after_time']}"}
+                "reason": f"User-configured pre-market: opens {user_min} MYT.",
+                "window": f"Before {user_min}"}
+    if t > user_max:
+        return {"allowed": False,
+                "reason": f"User-configured cutoff: after {user_max} MYT.",
+                "window": f"After {user_max}"}
+
+    # Optionally also block new entries in the no-safe-entry tail
+    if not is_safe_entry_window(now):
+        sess = current_session(now)
+        sess_name = sess.name if sess else "?"
+        return {"allowed": False,
+                "reason": (f"In {sess_name} — too late for new entries "
+                           "(safe-entry window ended 16:00)."),
+                "window": sess_name}
+
+    sess = current_session(now)
     return {"allowed": True,
-            "reason": f"Trading window ({p['no_entry_before_time']}–"
-                      f"{p['no_entry_after_time']} MYT).",
-            "window": f"Active ({t})"}
+            "reason": f"{sess.name} session — fills active.",
+            "window": f"{sess.name} ({t})"}
 
 
 def validate_stop_loss(entry_price: float, proposed_sl: float) -> dict:

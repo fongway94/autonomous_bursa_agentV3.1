@@ -637,21 +637,19 @@ def start(interval_sec: int = 3600) -> bool:
     """
     global _THREAD
     with _LOCK:
+        # Guard 1: module-level handle (fast, local)
         if _THREAD is not None and _THREAD.is_alive():
             return False
-        _STOP_EVENT.clear()
+
         my_pid = os.getpid()
-        # v3.1.8: Harden against same-process duplicate threads.
-        # The module-level _THREAD handle can be reset to None during
-        # Streamlit module reloads or stop()/join(timeout) races while
-        # the actual daemon thread is still alive.  We now enforce
-        # single-process uniqueness via three layers:
-        #   1) _THREAD handle (fast, local)
-        #   2) threading.enumerate() scan for any alive "bursa-scheduler"
-        #   3) DB heartbeat freshness for this PID
+
+        # Guard 2: threading.enumerate() scan for any alive "bursa-scheduler"
+        # (catches lost-reference threads where _THREAD handle was reset)
         for t in threading.enumerate():
             if getattr(t, "name", None) == "bursa-scheduler" and t.is_alive():
                 return False
+
+        # Guard 3: DB heartbeat freshness for this PID
         state = get_scheduler_state()
         if (state.get("running") == 1 and state.get("owner_pid") == my_pid):
             hb = state.get("last_heartbeat")
@@ -664,6 +662,13 @@ def start(interval_sec: int = 3600) -> bool:
                         return False
                 except Exception:
                     pass
+
+        # v3.1.9: ONLY clear the stop event AFTER all guards pass.
+        # Previously _STOP_EVENT.clear() was before Guard 2, which meant
+        # a slow-dying old thread would see the event cleared and sleep
+        # for up to an hour instead of exiting — permanently blocking start().
+        _STOP_EVENT.clear()
+
         # Detect + log if a stale owner is being evicted (likely a
         # ghost thread from a previous Streamlit Cloud deploy).
         prev = state
@@ -714,7 +719,14 @@ def is_running() -> bool:
 def force_restart(interval_sec: int = 3600) -> None:
     """User-facing 'Force Reboot Robo-Trader'."""
     stop()
-    time.sleep(0.5)
+    # v3.1.9: poll briefly for the old thread to actually die.
+    # join(timeout=5) is too short if the thread is mid-scan (~100s).
+    # Without this, start()'s Guard 2 sees the old thread and returns False.
+    for _ in range(25):
+        if not any(getattr(t, "name", None) == "bursa-scheduler" and t.is_alive()
+                   for t in threading.enumerate()):
+            break
+        time.sleep(0.2)
     start(interval_sec=interval_sec)
 
 
@@ -727,7 +739,7 @@ def ensure_started(interval_sec: int = 3600,
     If another process is the owner and beat recently, do NOTHING.
 
     1. If another live owner exists → do nothing.
-    2. If we own it and our local thread is alive → do nothing.
+    2. If we own it and our local thread is alive → all good.
     3. If stale/no owner → start.
     4. If our local thread is a ghost (DB shows other owner) → force-restart.
 

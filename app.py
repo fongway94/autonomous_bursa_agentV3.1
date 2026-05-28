@@ -990,6 +990,99 @@ with tab_robo:
     if ss.get("last_error"):
         st.error(f"Last error: `{ss['last_error'][:400]}`")
 
+    # ---- v3.1.12: Watchdog & Cycle Health panel ----
+    # Reads scheduler.get_watchdog_status() (cheap, single SQLite query +
+    # in-memory thread checks). Surfaces "is the v3.1.10 autonomous-
+    # recovery actually running?" so the user doesn't have to dig in logs.
+    try:
+        wd = sched.get_watchdog_status()
+    except Exception as _wd_err:
+        wd = None
+        st.warning(f"Watchdog status unavailable: {_wd_err}")
+
+    if wd is not None:
+        # Headline card — green if watchdog alive, red if dead
+        wd_alive = wd.get("watchdog_alive", False)
+        cycle_in_flight = wd.get("cycle_in_flight", False)
+        cycle_running_for = wd.get("cycle_running_for_sec")
+        warn_sec = wd.get("cycle_warn_sec", 300)
+        timeout_sec = wd.get("watchdog_timeout_sec", 600)
+
+        # Decide overall colour: bad if watchdog dead OR a cycle is past
+        # the warn threshold; warn if past the soft warn; otherwise good.
+        if not wd_alive:
+            card_class = "bursa-card-bad"
+            wd_headline = "🔴 Watchdog NOT running"
+        elif cycle_running_for is not None and cycle_running_for > warn_sec:
+            card_class = "bursa-card-warn"
+            wd_headline = (
+                f"🟡 Cycle running for {cycle_running_for:.0f}s "
+                f"(soft-warn threshold {warn_sec}s; watchdog will force "
+                f"handoff at {timeout_sec}s)"
+            )
+        elif cycle_in_flight:
+            card_class = "bursa-card-info"
+            wd_headline = (
+                f"🛡️ Watchdog active — cycle in flight "
+                f"({cycle_running_for:.0f}s elapsed)"
+                if cycle_running_for is not None
+                else "🛡️ Watchdog active — cycle in flight"
+            )
+        else:
+            card_class = "bursa-card-good"
+            wd_headline = "🛡️ Watchdog active — no cycle in flight"
+
+        # Recent ops events — "anything bad in the last 24h?"
+        n_timeouts = wd.get("recent_timeouts_24h", 0)
+        n_slow = wd.get("recent_slow_cycles_24h", 0)
+        n_respawns = wd.get("recent_respawns_24h", 0)
+        n_orphans = wd.get("orphan_thread_count", 0)
+
+        # Roll-up colour for the "last 24h" line
+        if n_timeouts > 0:
+            recent_line = (
+                f"⚠️ {n_timeouts} CYCLE_TIMEOUT, {n_slow} CYCLE_SLOW, "
+                f"{n_respawns} WATCHDOG_RESPAWN in last 24h"
+            )
+        elif n_slow > 0 or n_respawns > 0:
+            recent_line = (
+                f"ℹ️ 0 timeouts, {n_slow} slow cycle(s), "
+                f"{n_respawns} watchdog respawn(s) in last 24h"
+            )
+        else:
+            recent_line = "✅ 0 timeouts, 0 slow cycles, 0 respawns in last 24h"
+
+        st.markdown(
+            f"""
+            <div class="bursa-card {card_class}">
+              <div style="font-weight:600; margin-bottom:6px;">{wd_headline}</div>
+              <div class="kvp"><span class="k">Watchdog timeout</span>
+                <span class="v">{timeout_sec}s ({timeout_sec//60} min)</span></div>
+              <div class="kvp"><span class="k">Soft-warn threshold</span>
+                <span class="v">{warn_sec}s ({warn_sec//60} min)</span></div>
+              <div class="kvp"><span class="k">Cycle in flight</span>
+                <span class="v">{"YES — since " + (wd.get("cycle_started_at") or "?")
+                                  if cycle_in_flight else "no"}</span></div>
+              <div class="kvp"><span class="k">Orphaned threads tracked</span>
+                <span class="v">{n_orphans}</span></div>
+              <div style="margin-top:8px; color: var(--text-soft); font-size: 0.9em;">
+                {recent_line}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # If the watchdog is dead while the scheduler is running, give
+        # the user an actionable nudge — calling ensure_started will
+        # respawn it (v3.1.11 behaviour).
+        if not wd_alive and running:
+            st.info(
+                "💡 The watchdog is not running but the scheduler is. "
+                "The next Streamlit interaction (or ♻️ Force Restart) "
+                "will respawn it automatically (v3.1.11)."
+            )
+
     st.markdown("### Controls")
     cc = st.columns(4)
     # v3.1.9: honest feedback when start() returns False (zombie thread dying)

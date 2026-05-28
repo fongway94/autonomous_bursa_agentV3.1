@@ -641,9 +641,32 @@ def start(interval_sec: int = 3600) -> bool:
             return False
         _STOP_EVENT.clear()
         my_pid = os.getpid()
+        # v3.1.8: Harden against same-process duplicate threads.
+        # The module-level _THREAD handle can be reset to None during
+        # Streamlit module reloads or stop()/join(timeout) races while
+        # the actual daemon thread is still alive.  We now enforce
+        # single-process uniqueness via three layers:
+        #   1) _THREAD handle (fast, local)
+        #   2) threading.enumerate() scan for any alive "bursa-scheduler"
+        #   3) DB heartbeat freshness for this PID
+        for t in threading.enumerate():
+            if getattr(t, "name", None) == "bursa-scheduler" and t.is_alive():
+                return False
+        state = get_scheduler_state()
+        if (state.get("running") == 1 and state.get("owner_pid") == my_pid):
+            hb = state.get("last_heartbeat")
+            if hb:
+                try:
+                    hb_dt = datetime.strptime(hb, "%Y-%m-%d %H:%M:%S").replace(
+                        tzinfo=timezone(timedelta(hours=8)))
+                    age = (get_myt_now() - hb_dt).total_seconds()
+                    if age < 300:
+                        return False
+                except Exception:
+                    pass
         # Detect + log if a stale owner is being evicted (likely a
         # ghost thread from a previous Streamlit Cloud deploy).
-        prev = get_scheduler_state()
+        prev = state
         prev_pid = prev.get("owner_pid", 0) or 0
         if prev_pid and prev_pid != my_pid:
             log_scheduler_event(
@@ -672,7 +695,10 @@ def stop() -> None:
     global _THREAD
     with _LOCK:
         _STOP_EVENT.set()
-        update_scheduler_state(kill_switch=1)
+        # v3.1.8: also set running=0 so that start() / ensure_started()
+        # can immediately respawn after an intentional stop, rather than
+        # being blocked by the DB-based same-process guard.
+        update_scheduler_state(kill_switch=1, running=0)
         if _THREAD is not None:
             _THREAD.join(timeout=5)
         _THREAD = None
@@ -731,6 +757,13 @@ def ensure_started(interval_sec: int = 3600,
     # Case 2: we own it and our local thread is alive → all good.
     if current_owner == my_pid and is_running():
         return
+
+    # v3.1.8: DB indicates a live same-process owner but _THREAD handle
+    # was lost (Streamlit module reload, stop/join race, etc.).  start()
+    # will reject too, but short-circuit here to avoid log noise.
+    if current_owner == my_pid and not is_running():
+        if bool(state.get("running", 0)) and age is not None and age < 300:
+            return
 
     # Case 3: stale or no owner — we should take over.
     if not is_running():

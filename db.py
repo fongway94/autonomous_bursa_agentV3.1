@@ -388,15 +388,6 @@ def init_db():
 # Helpers exposed to callers
 # ---------------------------------------------------------------------------
 
-def fetch_one(sql, args=()):
-    with connect(readonly=True) as c:
-        return c.execute(sql, args).fetchone()
-
-
-def fetch_all(sql, args=()):
-    with connect(readonly=True) as c:
-        return c.execute(sql, args).fetchall()
-
 
 def execute(sql, args=()):
     with connect() as c:

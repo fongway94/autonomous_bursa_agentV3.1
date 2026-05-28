@@ -44,7 +44,8 @@ def _reset_db_between_tests():
         for tbl in ("trades", "partial_exits", "trade_log",
                     "scheduler_log", "learning_events", "parameter_history",
                     "bias_history", "state_priors", "data_quality_log",
-                    "scan_cache", "alert_log"):
+                    "scan_cache", "alert_log", "maintenance_state",
+                    "regime_history"):
             c.execute(f"DELETE FROM {tbl}")
         # Reset scheduler_state singleton to v3 defaults
         c.execute(

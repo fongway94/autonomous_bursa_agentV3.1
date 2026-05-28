@@ -386,6 +386,15 @@ def execute_full_exit(trade_id: int, current_price: float,
     except Exception:
         pass
 
+    # v3.1.5: backup DB after every full exit (manual or auto) — preserves
+    # closed trade + updated cash balance + brain learning that follows
+    try:
+        from persistence import backup as _pers_backup, is_configured
+        if is_configured():
+            _pers_backup(reason=f"full exit trade #{trade_id} {outcome}")
+    except Exception:
+        pass
+
     return True, (f"Closed {t['ticker']} @ RM {fill_price:.3f}. "
                   f"Net P&L RM {net_pnl:+.2f} ({outcome}).")
 

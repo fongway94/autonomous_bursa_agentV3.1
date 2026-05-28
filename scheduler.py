@@ -97,13 +97,57 @@ def _explain_cycle_outcome(summary: dict, df, regime: dict,
                 "no breakout or pullback setups today.")
 
     # 4. Above-threshold qualifiers
+        # 4. Above-threshold qualifiers
     qualifiers = gold_buys_all[gold_buys_all["confidence"] >= threshold]
     if len(qualifiers) == 0:
         best_conf = float(gold_buys_all["confidence"].max())
+
+        # v3.1.4: include regime trend so user knows if BEAR is weakening
+        # (entries may resume soon) or strengthening (still wait).
+        trend_note = ""
+        try:
+            from repository import get_regime_trend
+            trend = get_regime_trend(lookback_hours=24)
+            if trend["samples"] >= 2:
+                # Direction word depends on regime — strengthening BEAR
+                # is bad for entries; strengthening BULL is good.
+                if regime_name == "BEAR":
+                    if trend["direction"] == "WEAKENING":
+                        feel = "weakening (good — entries may resume soon)"
+                    elif trend["direction"] == "STRENGTHENING":
+                        feel = "strengthening (BEAR getting deeper)"
+                    else:
+                        feel = "stable"
+                elif regime_name == "BULL":
+                    feel = trend["direction"].lower()
+                else:
+                    feel = trend["direction"].lower()
+
+                trend_note = (
+                    f" Regime conviction: {trend['current_conviction']:.0f}% "
+                    f"(was {trend['avg_recent_conviction']:.0f}% avg over last "
+                    f"24h → {feel})."
+                )
+                # Add the actionable signal — KLCI distance from 200-EMA
+                if trend["ema_200_distance_pct"] is not None:
+                    dist = trend["ema_200_distance_pct"]
+                    if dist < 0:
+                        trend_note += (
+                            f" KLCI is {abs(dist):.1f}% BELOW its 200-EMA "
+                            "— watch for it to cross ABOVE for regime flip."
+                        )
+                    else:
+                        trend_note += (
+                            f" KLCI is {dist:.1f}% above its 200-EMA — "
+                            "regime should normalize as trend confirms."
+                        )
+        except Exception:
+            pass  # trend is a nice-to-have, never block the explanation
+
         return (f"{len(gold_buys_all)} GOLD BUY signal(s) found, but the "
                 f"highest confidence was {best_conf:.0f}/100 — below the "
                 f"{regime_name} regime threshold of {threshold:.0f}. "
-                "Agent stays defensive.")
+                f"Agent stays defensive.{trend_note}")
 
     # 5. Position cap
     if active_count >= max_positions:

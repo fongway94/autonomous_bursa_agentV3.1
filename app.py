@@ -290,10 +290,18 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    # v3.1.9: start() can return False if a zombie thread is still dying.
+    # Give honest feedback instead of always saying "started".
     if not running:
         if st.button("♻️ Start Robo-Trader", use_container_width=True):
-            sched.start(interval_sec=int(ss.get("interval_sec", 3600)))
-            st.success("Robo-Trader started.")
+            ok = sched.start(interval_sec=int(ss.get("interval_sec", 3600)))
+            if ok:
+                st.success("Robo-Trader started.")
+            else:
+                st.warning(
+                    "Robo-Trader was already running or is restarting — "
+                    "refresh in a few seconds."
+                )
             st.rerun()
     else:
         if st.button("🛑 Stop Robo-Trader", use_container_width=True):
@@ -968,10 +976,12 @@ with tab_robo:
 
     st.markdown("### Controls")
     cc = st.columns(4)
+    # v3.1.9: honest feedback when start() returns False (zombie thread dying)
     if not running:
         if cc[0].button("▶️ Start", use_container_width=True, type="primary"):
-            sched.start(int(ss.get("interval_sec", 3600)))
-            st.success("Started."); st.rerun()
+            ok = sched.start(int(ss.get("interval_sec", 3600)))
+            st.success("Started." if ok else "Already running — refresh.")
+            st.rerun()
     else:
         if cc[0].button("🛑 Stop", use_container_width=True):
             sched.stop(); st.warning("Stopped."); st.rerun()
@@ -1493,7 +1503,9 @@ with tab_settings:
     st.caption(
         "Backs up your entire agent database (trades, brain learning, "
         "parameters, settings) to a private GitHub Gist. Without this, "
-        "every Streamlit Cloud redeploy or 7-day sleep wipes all data."
+        "every Streamlit Cloud redeploy or 7-day sleep wipes all data.\n\n"
+        "v3.1.9: You can also set a GIST_ID env var as a fallback "
+        "if the local marker file is lost during a container reset."
     )
     from persistence import (get_status as _pers_status,
                               backup as _pers_backup,

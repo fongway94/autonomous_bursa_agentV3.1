@@ -113,7 +113,7 @@ def test_explains_all_qualifiers_already_held():
         _empty_summary(), df, _regime("BULL", 0.60), 60.0,
         active_count=2, max_positions=8, autotrade_enabled=True,
     )
-    assert "already in active positions" in msg
+    assert "already held" in msg
 
 
 def test_explains_risk_rejected():

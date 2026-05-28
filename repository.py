@@ -280,13 +280,91 @@ def get_scheduler_state() -> dict:
     return dict(row) if row else {}
 
 
+# v3.1.13: cache of column names in scheduler_state so we can filter
+# out unknown fields BEFORE building the SET clause. This is the belt+
+# suspenders safety net for schema drift — even if a Gist restore brings
+# in an old schema and init_db() hasn't been re-run yet, we won't crash.
+# Cache is per-process; invalidated on first OperationalError.
+_SCHEDULER_STATE_COLUMNS_CACHE: set[str] | None = None
+
+
+def _get_scheduler_state_columns(force_refresh: bool = False) -> set[str]:
+    """Return the set of column names in scheduler_state. Cached per process."""
+    global _SCHEDULER_STATE_COLUMNS_CACHE
+    if _SCHEDULER_STATE_COLUMNS_CACHE is not None and not force_refresh:
+        return _SCHEDULER_STATE_COLUMNS_CACHE
+    try:
+        with connect(readonly=True) as c:
+            rows = c.execute("PRAGMA table_info(scheduler_state)").fetchall()
+        _SCHEDULER_STATE_COLUMNS_CACHE = {r["name"] for r in rows}
+    except Exception:
+        # If we can't introspect, return None so caller falls through to
+        # the legacy "try and pray" path.
+        return set()
+    return _SCHEDULER_STATE_COLUMNS_CACHE
+
+
 def update_scheduler_state(**fields) -> None:
+    """
+    Update one or more columns in the scheduler_state singleton row.
+
+    v3.1.13: silently drops any field whose column doesn't exist in the
+    current schema. This is the safety net for the production bug where
+    a Gist restore brought in an old schema lacking ``cycle_started_at``
+    and crashed every call to this function. The primary fix is
+    ``persistence.restore()`` re-running ``init_db()`` after restore,
+    but this guard means we never hard-crash on schema drift again.
+    """
     if not fields:
         return
+
+    # Filter fields against the live schema. If introspection fails
+    # (empty set), fall back to the old behaviour and let SQLite tell us.
+    known_cols = _get_scheduler_state_columns()
+    if known_cols:
+        unknown = [k for k in fields if k not in known_cols]
+        if unknown:
+            # Try a one-shot refresh in case init_db() just ran and added
+            # the column — covers the boot-restore race window.
+            known_cols = _get_scheduler_state_columns(force_refresh=True)
+            unknown = [k for k in fields if k not in known_cols]
+        if unknown:
+            # Still unknown — log once and drop them.
+            try:
+                from logger import get_logger
+                get_logger("repository").warning(
+                    f"update_scheduler_state: dropping unknown column(s) "
+                    f"{unknown} — schema may be pre-migration. "
+                    "Run db.init_db() to apply pending ALTER TABLEs."
+                )
+            except Exception:
+                pass
+            fields = {k: v for k, v in fields.items() if k in known_cols}
+            if not fields:
+                return
+
     set_clause = ",".join(f"{k}=?" for k in fields.keys())
     args = tuple(fields.values())
-    with connect() as c:
-        c.execute(f"UPDATE scheduler_state SET {set_clause} WHERE id=1", args)
+    try:
+        with connect() as c:
+            c.execute(f"UPDATE scheduler_state SET {set_clause} WHERE id=1",
+                       args)
+    except Exception:
+        # Last-ditch: invalidate the column cache and retry once. Covers
+        # the case where the schema changed under us between the cache
+        # read and the write.
+        global _SCHEDULER_STATE_COLUMNS_CACHE
+        _SCHEDULER_STATE_COLUMNS_CACHE = None
+        known_cols = _get_scheduler_state_columns(force_refresh=True)
+        if known_cols:
+            fields = {k: v for k, v in fields.items() if k in known_cols}
+        if not fields:
+            return
+        set_clause = ",".join(f"{k}=?" for k in fields.keys())
+        args = tuple(fields.values())
+        with connect() as c:
+            c.execute(f"UPDATE scheduler_state SET {set_clause} WHERE id=1",
+                       args)
 
 # =========================================================================
 # DAILY MAINTENANCE IDEMPOTENCY (v3.1.1)

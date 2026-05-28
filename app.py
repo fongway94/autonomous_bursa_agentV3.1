@@ -1401,12 +1401,30 @@ with tab_settings:
                        use_container_width=True):
             with st.spinner("Uploading to Gist…"):
                 res = _pers_backup(force=True, reason="manual button")
-            if res["ok"]:
-                st.success(f"✅ Backup OK ({res['size_kb']:.1f} KB) → "
-                           f"gist {res['gist_id'][:12]}…")
+            # Persist the result in session_state so user can READ
+            # the error before any rerun wipes it.
+            st.session_state["_last_backup_result"] = res
+
+        # Show the last backup attempt's result persistently
+        last_res = st.session_state.get("_last_backup_result")
+        if last_res:
+            if last_res["ok"]:
+                st.success(
+                    f"✅ Backup OK ({last_res['size_kb']:.1f} KB) → "
+                    f"gist {last_res['gist_id'][:12]}…  "
+                    f"[View at https://gist.github.com/{last_res['gist_id']}]"
+                )
             else:
-                st.error(f"❌ Backup failed: {res['reason']}")
-            st.rerun()
+                st.error(
+                    f"❌ Backup failed: {last_res['reason']}\n\n"
+                    "**Common causes:**\n"
+                    "- Wrong token type: Fine-grained PATs don't support "
+                    "Gists. Use a CLASSIC token from "
+                    "https://github.com/settings/tokens with scope **`gist`** "
+                    "only.\n"
+                    "- Token expired: regenerate and update Streamlit Secrets.\n"
+                    "- Network blip: try again."
+                )
         if bc2.button("♻️ Restore from latest backup",
                        use_container_width=True):
             st.warning(

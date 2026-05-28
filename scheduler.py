@@ -19,6 +19,29 @@ INSERT-OR-UPDATE on scheduler_state.
 If the user wants a real production setup, they can run
 `python -m scheduler --daemon` from cron / Task Scheduler — the same
 loop code is reused.
+
+v3.1.10 — Zombie thread recovery
+--------------------------------
+Earlier guards in v3.1.8/3.1.9 were over-conservative: when a loop
+got stuck inside a long network call (e.g. yfinance hang) or inside a
+multi-second `_STOP_EVENT.wait()` past the 5-second stop() join window,
+the thread would survive a Stop / Kill-Switch click. On the next
+Start click, `start()` Guard 2 would enumerate threads, find the still-
+alive zombie, ADOPT it, and return False — leaving the UI permanently
+on "🔴 STOPPED" with no path back to RUNNING.
+
+The fix is the `_ORPHANED_THREAD_IDS` registry:
+  * `stop()` records the dying thread's `ident` here (regardless of
+    whether the bounded join() succeeded).
+  * `start()` Guard 2 IGNORES any "bursa-scheduler" thread whose ident
+    is in this set — they are zombies en route to self-termination
+    via the existing owner_pid eviction inside `_loop`.
+  * `force_restart()` no longer blocks for 30 s waiting for the zombie
+    to die. The zombie will self-cull on its next wake-up.
+
+The existing `_loop` ownership check (compares its `my_pid` against
+`scheduler_state.owner_pid` on every iteration) guarantees the orphan
+exits cleanly the moment it next wakes up; we do not leak threads.
 """
 
 from __future__ import annotations
@@ -47,6 +70,20 @@ log = get_logger("scheduler")
 _THREAD: threading.Thread | None = None
 _LOCK = threading.RLock()
 _STOP_EVENT = threading.Event()
+
+# v3.1.10: registry of thread idents that stop() has asked to exit but
+# that may still be alive (stuck in a sleep / blocking I/O). Guard 2
+# in start() must skip these — adopting a dying thread is what caused
+# the "permanently STOPPED" UI bug.
+_ORPHANED_THREAD_IDS: set[int] = set()
+
+
+def _gc_orphaned_thread_ids() -> None:
+    """Remove idents from the orphan set whose thread has actually died."""
+    if not _ORPHANED_THREAD_IDS:
+        return
+    alive_idents = {t.ident for t in threading.enumerate() if t.is_alive()}
+    _ORPHANED_THREAD_IDS.intersection_update(alive_idents)
 
 
 # -------------------------------------------------------------------------
@@ -646,24 +683,60 @@ def _loop(interval_sec: int, my_pid: int):
 # Public control
 # -------------------------------------------------------------------------
 
+def _find_live_non_orphan_scheduler_thread() -> threading.Thread | None:
+    """
+    Return the first alive thread named ``bursa-scheduler`` whose ident
+    is NOT in ``_ORPHANED_THREAD_IDS``.
+
+    v3.1.10: zombies that stop() asked to exit but couldn't kill within
+    the join() window MUST be skipped here — otherwise start() Guard 2
+    treats them as "live workers", adopts the handle, and returns False,
+    permanently jamming the UI on STOPPED.
+    """
+    for t in threading.enumerate():
+        if getattr(t, "name", None) != "bursa-scheduler":
+            continue
+        if not t.is_alive():
+            continue
+        if t.ident in _ORPHANED_THREAD_IDS:
+            continue
+        return t
+    return None
+
+
 def start(interval_sec: int = 3600) -> bool:
     """
     Start the background thread if not already running.
 
     Sets owner_pid to our process ID. Any older ghost loop (from a
-    previous Streamlit Cloud deploy) will detect the PID change on
-    its next iteration and exit cleanly.
+    previous Streamlit Cloud deploy, OR a zombie from a stuck loop in
+    this process) will detect the PID change on its next iteration and
+    exit cleanly.
 
     v3.1.9: Guards 2 and 3 now correctly handle the case where the
     local _THREAD handle is lost/crashed but the DB still shows a
     fresh heartbeat. Previously this permanently blocked start().
+
+    v3.1.10: Guard 2 now skips threads in ``_ORPHANED_THREAD_IDS`` —
+    zombies that stop() requested to exit but that are still alive
+    (typically blocked in a sleep or a network call). Without this
+    skip, a single stuck cycle would permanently jam the UI on
+    "🔴 STOPPED" with no way back to RUNNING.
     """
     global _THREAD
     with _LOCK:
         my_pid = os.getpid()
 
-        # Guard 1: module-level handle (fast, local)
-        if _THREAD is not None and _THREAD.is_alive():
+        # GC the orphan registry first — any zombie that has finally
+        # exited gets cleared out, so future starts don't carry baggage.
+        _gc_orphaned_thread_ids()
+
+        # Guard 1: module-level handle (fast, local). Skip if it's an
+        # orphan we already asked to die — it shouldn't normally be
+        # reassigned here but defensive check is cheap.
+        if (_THREAD is not None
+                and _THREAD.is_alive()
+                and _THREAD.ident not in _ORPHANED_THREAD_IDS):
             log_scheduler_event(
                 "START_REJECT",
                 f"PID {my_pid}: _THREAD handle points to alive thread",
@@ -675,19 +748,15 @@ def start(interval_sec: int = 3600) -> bool:
         db_running = bool(state.get("running", 0))
         db_owner = state.get("owner_pid", 0) or 0
 
-        # Guard 2: scan threading.enumerate() for any alive "bursa-scheduler".
-        # If we find one but our _THREAD handle is lost, adopt it.
-        # If we find one and DB says it's ours too, don't duplicate.
-        found_alive = None
-        for t in threading.enumerate():
-            if getattr(t, "name", None) == "bursa-scheduler" and t.is_alive():
-                found_alive = t
-                break
+        # Guard 2: scan threading.enumerate() for any alive
+        # "bursa-scheduler" that is NOT a known orphan.
+        found_alive = _find_live_non_orphan_scheduler_thread()
 
         if found_alive is not None:
-            # If we have a local handle and it's the same thread, Guard 1
-            # already caught it. If _THREAD is dead/None but enumerate
-            # finds an alive one, adopt it rather than spawning a duplicate.
+            # Found a non-orphan alive scheduler thread. If our local
+            # handle is dead/None, adopt it rather than spawning a
+            # duplicate — this preserves the "single loop per process"
+            # invariant.
             if _THREAD is None or not _THREAD.is_alive():
                 _THREAD = found_alive
                 log_scheduler_event(
@@ -698,9 +767,9 @@ def start(interval_sec: int = 3600) -> bool:
                 )
                 return False
 
-            # _THREAD handle exists but points to a different dead thread,
-            # while enumerate found another alive one. Proceed to start new;
-            # old will self-evict via owner_pid.
+            # _THREAD points to a different dead thread, but enumerate
+            # found another alive non-orphan. Don't double-start; the
+            # old loop will self-evict via owner_pid.
             if db_running and db_owner == my_pid:
                 log_scheduler_event(
                     "START_REJECT",
@@ -718,9 +787,12 @@ def start(interval_sec: int = 3600) -> bool:
             )
 
         # Guard 3: DB heartbeat freshness for this PID.
-        # ONLY block if we have a local alive thread (Guard 1 or 2).
-        # If the thread crashed, the DB is stale — don't let it block recovery.
-        thread_alive = (_THREAD is not None and _THREAD.is_alive())
+        # ONLY block if we have a local alive (and non-orphan) thread.
+        # If the thread crashed or has been orphaned by stop(), the DB
+        # is stale — don't let it block recovery.
+        thread_alive = (_THREAD is not None
+                         and _THREAD.is_alive()
+                         and _THREAD.ident not in _ORPHANED_THREAD_IDS)
         if thread_alive and (state.get("running") == 1 and state.get("owner_pid") == my_pid):
             hb = state.get("last_heartbeat")
             if hb:
@@ -777,7 +849,15 @@ def start(interval_sec: int = 3600) -> bool:
 
 
 def stop() -> None:
-    """Request the thread to exit."""
+    """
+    Request the thread to exit.
+
+    v3.1.10: register the dying thread's ident in ``_ORPHANED_THREAD_IDS``
+    BEFORE the bounded join() — so even if the thread is stuck inside a
+    long network call and outlives the 5-second join, subsequent start()
+    calls know to ignore it. This guarantees the UI can always recover
+    from STOPPED → RUNNING.
+    """
     global _THREAD
     with _LOCK:
         _STOP_EVENT.set()
@@ -785,28 +865,46 @@ def stop() -> None:
         # Also set running=0 so Guard 2 in start() won't block on zombies.
         update_scheduler_state(kill_switch=1, running=0, owner_pid=0)
         if _THREAD is not None:
+            # v3.1.10: mark as orphaned BEFORE join — if join times out
+            # because the thread is stuck, the orphan flag still applies.
+            try:
+                if _THREAD.ident is not None:
+                    _ORPHANED_THREAD_IDS.add(_THREAD.ident)
+            except Exception:
+                pass
             _THREAD.join(timeout=5)
         _THREAD = None
 
 
 def is_running() -> bool:
+    """
+    True iff we have a local non-orphaned alive thread AND the DB still
+    shows running=1. v3.1.10: explicitly excludes orphan threads so a
+    zombie that survived stop() doesn't make the badge lie.
+    """
     with _LOCK:
-        alive = _THREAD is not None and _THREAD.is_alive()
+        alive = (_THREAD is not None
+                 and _THREAD.is_alive()
+                 and _THREAD.ident not in _ORPHANED_THREAD_IDS)
     state = get_scheduler_state()
     return alive and bool(state.get("running", 0))
 
 
 def force_restart(interval_sec: int = 3600) -> None:
-    """User-facing 'Force Reboot Robo-Trader'."""
+    """
+    User-facing 'Force Reboot Robo-Trader'.
+
+    v3.1.10: do NOT block waiting for the old thread to die. The old
+    thread is now registered as an orphan (by stop()), so start()'s
+    Guard 2 will correctly skip it. The orphan self-terminates on its
+    next wake-up via the owner_pid mismatch check in _loop.
+
+    Previously this function polled for up to 30 s waiting for the
+    zombie to actually exit, which could still time out for threads
+    stuck in a long network call — leaving the user with a permanently
+    STOPPED scheduler. The orphan registry fixes that root cause.
+    """
     stop()
-    # v3.1.9: poll briefly for the old thread to actually die.
-    # join(timeout=5) is too short if the thread is mid-scan (~100s).
-    # Without this, start()'s Guard 2 sees the old thread and returns False.
-    for _ in range(150):   # 30 seconds total (150 × 0.2s)
-        if not any(getattr(t, "name", None) == "bursa-scheduler" and t.is_alive()
-                   for t in threading.enumerate()):
-            break
-        time.sleep(0.2)
     start(interval_sec=interval_sec)
 
 

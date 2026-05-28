@@ -3,7 +3,7 @@
 **Living reference document.** Update as the project evolves.
 Single source of truth for: architecture decisions, why things were built the way they are, known issues, operational runbooks, and the rationale behind every design choice.
 
-Last updated: 2026-05-28 (v3.1.7)
+Last updated: 2026-05-28 (v3.1.10)
 
 ---
 
@@ -35,6 +35,7 @@ Last updated: 2026-05-28 (v3.1.7)
 - **Fully auditable** — every state change leaves a row in a log table.
 - **Real Bursa mechanics** — 100-share lots, 0.15% fees, volume-aware slippage, real session hours, public holidays.
 - **Durable memory** — the brain persists indefinitely via Gist backup, surviving every container reset.
+- **Self-healing scheduler** — orphan-thread registry + runaway-cycle watchdog ensure the loop can't get permanently stuck (v3.1.10).
 - **Light theme only** — enforced by both Streamlit config and CSS override.
 - **Defaults err on safety** — 1% risk/trade, auto-trade ON but with conservative thresholds.
 
@@ -44,12 +45,12 @@ Last updated: 2026-05-28 (v3.1.7)
 
 | | |
 |---|---|
-| **Codebase version** | v3.1.7 |
+| **Codebase version** | v3.1.10 |
 | **Deployment** | Streamlit Cloud (live) |
 | **Database** | SQLite WAL at `~/.bursa_agent_data/bursa_agent.db` |
 | **DB persistence** | **GitHub Gist backup (private)** — survives container resets |
-| **Source LOC** | ~8,400 across **19 Python modules** |
-| **Test count** | **145 passing in ~3.5 seconds** |
+| **Source LOC** | ~8,700 across **19 Python modules** |
+| **Test count** | **168 passing in ~30 seconds** (was 145 at v3.1.7) |
 | **Documentation files** | SETUP_GUIDE.md, USER_GUIDE.md, LIVE_TRIGGER_GUIDE.md, CHANGES_V2_TO_V3.md, CHANGES_V3_TO_V3_1.md, PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md |
 | **Capital (paper)** | RM 20,000 default (user adjustable) |
 | **Brokers supported** | NOOP (notification only), MoomooAdapter stub (v4 ready) |
@@ -64,6 +65,8 @@ Last updated: 2026-05-28 (v3.1.7)
                          │  Hourly daemon thread           │
                          │  PID-owned, self-healing        │
                          │  Boot-debounced                 │
+                         │  + 🦴 Orphan registry  (v3.1.10)│
+                         │  + ⏱️ Runaway watchdog (v3.1.10)│
                          └──────────────┬─────────────────┘
                                         │
    ┌────────────────────────────────────┼─────────────────────────────────┐
@@ -76,7 +79,7 @@ Last updated: 2026-05-28 (v3.1.7)
    │            (fills + cash)    →    state_priors update                 │
    │                                                                       │
    │                              ↓                                        │
-   │  live_trigger  →  notifier (Telegram + Email)  →  YOUR PHONE         │
+   │  live_trigger  →  notifier (Telegram + Email)  →  YOUR PHONE          │
    │                                                                       │
    └────────────────────────────────────┼─────────────────────────────────┘
                                         │
@@ -84,18 +87,19 @@ Last updated: 2026-05-28 (v3.1.7)
                   ┌─────────────────────────────────────┐
                   │  SQLite (WAL) — local on container  │
                   │  trades, account, state_priors,     │
-                  │  bias_state, scheduler_state,       │
+                  │  bias_state, scheduler_state        │
+                  │  (incl. cycle_started_at v3.1.10),  │
                   │  scheduler_log, trade_log,          │
                   │  learning_events, parameter_history,│
                   │  alert_log, maintenance_state,      │
-                  │  regime_history ...                 │
+                  │  regime_history, meta ...           │
                   └─────────────────┬───────────────────┘
                                     │ every closed trade
                                     │ + hourly heartbeat
                                     ▼
                   ┌─────────────────────────────────────┐
                   │  persistence.py  →  PRIVATE GIST    │
-                  │  (gzip + base64-encoded)             │
+                  │  (gzip + base64-encoded)            │
                   │  Survives container resets,         │
                   │  redeploys, 7-day sleeps.           │
                   └─────────────────────────────────────┘
@@ -109,6 +113,8 @@ Last updated: 2026-05-28 (v3.1.7)
 Communication between modules happens via **SQLite**, not in-memory objects. This means scheduler thread + UI re-renders never deadlock or share mutable state.
 
 The Gist backup runs out-of-band — never blocking trade execution, always degrading silently if GitHub is unreachable.
+
+The scheduler now spawns **two** daemon threads at start: the cycle loop (`bursa-scheduler`) and the runaway-cycle watchdog (`bursa-watchdog`). The watchdog runs every 60 s and forces a clean handoff if any cycle exceeds 10 minutes (v3.1.10).
 
 ---
 
@@ -200,6 +206,35 @@ Every decision below has a deliberate rationale. Don't change them without under
 - **Without this token, all data is volatile.** The Settings tab shows a prominent warning if not configured.
 - All backup operations wrapped in try/except — never block trade execution. Failure degrades silently to "agent still works, data still ephemeral until token is set."
 
+### 4.16 Conservative duplicate-loop guards + silent ghost exit (v3.1.8)
+- Streamlit reruns the script on every interaction. Daemon threads usually survive but module-level handles can be lost on reload.
+- Before v3.1.8 each rerun could spawn a fresh scheduler thread that logged HEARTBEAT/SKIP before realizing it was a ghost — produced "10 SKIPs in 16 seconds" log spam.
+- Fix: `_loop` checks `owner_pid` FIRST. If another live owner exists (heartbeat < 5 min old), exit SILENTLY — no work, no log spam (one breadcrumb GHOST_EXIT row max per process).
+- `ensure_started()` is conservative: if another live owner is detected, do nothing. Adopt rather than duplicate alive threads when our local handle is lost.
+
+### 4.17 Crash + handle-loss recovery (v3.1.9)
+- Earlier guards could permanently block `start()` if the local `_THREAD` handle was lost while DB still showed a fresh heartbeat (e.g. Streamlit script reload race).
+- Guards 2 and 3 now only block when there is a *local* alive thread. If the thread crashed silently, the stale DB state is ignored and start() proceeds.
+- `_run_one_cycle` accepts `my_pid` so it can abort if ownership changed mid-cycle.
+- `_STOP_EVENT.clear()` moved to AFTER all guards pass — previously a slow-dying thread saw the event cleared and slept for up to an hour instead of exiting.
+
+### 4.18 Zombie thread recovery — orphan registry (v3.1.10) ⭐
+- **Problem class:** a `_loop` cycle gets stuck inside a long network call (yfinance hang) or sleeps past `stop()`'s 5-second join window. The thread survives stop. On the next Start click, `start()`'s Guard 2 enumerates threads, finds the still-alive zombie named `bursa-scheduler`, ADOPTS it (since the local handle was cleared), and returns False — leaving the UI permanently on "🔴 STOPPED" with no path back to RUNNING.
+- Reproduced live in the screenshot that prompted v3.1.10: heartbeat stuck at 17:00, last cycle at 12:00, Start/Force-Restart/Kill-Switch all did nothing.
+- **Fix:** module-level `_ORPHANED_THREAD_IDS: set[int]`. `stop()` records `_THREAD.ident` here BEFORE the bounded join — so even if the thread is stuck, the orphan flag still applies. `start()` Guard 2 SKIPS any `bursa-scheduler` thread whose ident is in this set. The orphan still self-terminates via the existing `owner_pid` mismatch check inside `_loop` — no thread leak.
+- `force_restart()` no longer blocks for 30 seconds polling for the zombie to die — useless if the thread is hung. The orphan flag does the work.
+- The set is garbage-collected at the top of each `start()` so dead idents don't accumulate.
+- **Tests:** `test_zombie_thread_recovery.py` (3 tests including the exact production scenario).
+
+### 4.19 Runaway-cycle watchdog (v3.1.10) ⭐
+- **Problem class:** the v3.1.10 orphan fix lets the *user* recover the UI by clicking Start. But what if no one is watching (overnight, weekend)? A single stuck cycle would still mean hours of no scans.
+- **Fix:** separate `bursa-watchdog` daemon thread spawned by `start()`. Reads `scheduler_state.cycle_started_at` (new column) every 60 s. If a cycle has been running > `WATCHDOG_CYCLE_TIMEOUT_SEC` (default 600 = 10 min), the watchdog (1) logs `CYCLE_TIMEOUT`, (2) clears `cycle_started_at`, (3) bumps `owner_pid` to a sentinel value (-1), (4) marks the stuck thread as orphaned.
+- The stuck `_loop` self-exits on its next wake via the existing `owner_pid` mismatch check. Next Streamlit rerun → `ensure_started()` spawns a fresh loop.
+- **Soft warn:** any cycle exceeding `CYCLE_DURATION_WARN_SEC` (default 300 = 5 min) logs `CYCLE_SLOW` even if it completes. Early visibility before the watchdog has to act.
+- **Critical caveat:** Python `threading` cannot interrupt blocking I/O. The watchdog cannot make the stuck cycle return faster — it only ensures the system *recovers* within 10 min instead of forever. That's why **every external call must have its own timeout**. Audited and confirmed: yfinance (15-30 s), requests (30-60 s), smtp (configurable).
+- **Single source of truth:** only the owner_pid process's watchdog acts on its own cycle. Cross-process false positives are impossible.
+- **Tests:** `test_watchdog_and_cycle_tracking.py` (8 tests).
+
 ---
 
 ## 5. Module-by-Module Reference
@@ -207,25 +242,35 @@ Every decision below has a deliberate rationale. Don't change them without under
 | Module | Purpose | Critical functions |
 |---|---|---|
 | `app.py` | Streamlit UI (8 tabs) | Tab handlers, sidebar, light theme CSS, boot-restore wiring |
-| `scheduler.py` | Background daemon thread | `start()`, `stop()`, `_loop()`, `_run_one_cycle()`, `_explain_cycle_outcome()` |
-| `screener.py` | Market scan, indicators, setup classifier | `screen_all_stocks()`, `analyze_stock_setup()`, `compute_indicators()` |
+| `scheduler.py` | Background daemon thread + runaway watchdog (v3.1.10) | `start()`, `stop()`, `force_restart()`, `_loop()`, `_run_one_cycle()`, `_watchdog_loop()`, `_start_watchdog()`, `_stop_watchdog()`, `_find_live_non_orphan_scheduler_thread()`, `_explain_cycle_outcome()` |
+| `screener.py` | Market scan, indicators, setup classifier | `screen_all_stocks()`, `analyze_stock_setup()`, `compute_indicators()`, `fetch_and_calculate()` |
 | `trading_engine.py` | Execute entries + exits, cash math | `execute_entry()`, `execute_full_exit()`, `execute_partial_exit()`, `auto_settle_trades()` |
 | `risk_manager.py` | Gate-keep proposed trades | `run_full_risk_check()`, `check_trading_time_window()`, `check_drawdown_circuit_breaker()` |
 | `learner.py` | Bayesian brain + walk-forward + ML classifier | `compute_state_action_score()`, `learn_from_trade_outcome()`, `run_walk_forward_optimization()`, `train_setup_classifier()` |
 | `market_analyzer.py` | KLCI regime detection, sector momentum, RS | `get_full_market_analysis()`, `detect_market_regime()` |
 | `market_calendar.py` | Bursa session boundaries + public holidays | `is_market_open()`, `is_safe_entry_window()`, `next_session_start()` |
-| `evaluation.py` | Sharpe, drawdown, calibration, benchmarks | `full_evaluation_report()`, `expectancy()` |
+| `evaluation.py` | Sharpe, drawdown, calibration, benchmarks | `full_evaluation_report()`, `expectancy()` (all yfinance calls have explicit timeouts as of v3.1.10) |
 | `data_quality.py` | OHLCV validator (catches bad yfinance bars) | `validate_ohlcv()` |
 | `repository.py` | All SQL access for trades/account/params | `insert_trade()`, `load_account()`, `try_claim_daily_task()`, `record_regime_snapshot()`, `get_regime_trend()` |
-| `db.py` | SQLite schema + connection (WAL) | `connect()`, `init_db()` |
-| `logger.py` | All log streams + rotating text log | `log_trade_event()`, `log_scheduler_event()`, `log_learning_event()`, `dedupe_scheduler_log_at_same_second()` |
+| `db.py` | SQLite schema + connection (WAL) | `connect()`, `init_db()` (adds `cycle_started_at` v3.1.10), `get_meta()`, `set_meta()` |
+| `logger.py` | All log streams + rotating text log | `log_trade_event()`, `log_scheduler_event()`, `log_learning_event()`, `dedupe_scheduler_log_at_same_second()`, `dedupe_scheduler_log_within_minute()` (v3.1.8) |
 | `watchlist.py` | 80 Bursa tickers + Shariah filter | `get_all_tickers()`, `is_shariah_compliant()`, `add_custom_ticker()`, `remove_custom_ticker()` |
 | `notifier.py` | Telegram + Email + dashboard alerts | `send_telegram()` (plain text default), `send_email()`, `dispatch()` |
 | `live_trigger.py` | Filter+dedup+format paper-trade events into alerts | `fire()`, `send_test_alert()` |
 | `broker_adapter.py` | Abstract broker interface (NOOP + Moomoo stub) | `BrokerAdapter.place_order()` (stubbed) |
 | **`persistence.py`** ⭐ | **Gist-backed DB backup + restore** | `backup()`, `restore()`, `boot_restore_once()`, `get_status()` |
+| `maintenance_reminders.py` | Holiday/PAT/WFO renewal reminder banners (v3.1.7) | `check_maintenance_status()`, `mark_pat_rotated()` |
 
 **Note:** `learning_engine.py` was removed in v3.1.3 — it was a 40-line backwards-compat shim from the v1→v2 refactor with zero remaining imports.
+
+### Scheduler invariants (v3.1.10)
+
+The scheduler module guarantees:
+1. **At most one** `bursa-scheduler` thread per process is treated as "live and authoritative". Zombies in the orphan registry are excluded from this count.
+2. **At most one** `bursa-watchdog` thread per process.
+3. `is_running()` is True ↔ a non-orphaned alive thread exists AND `scheduler_state.running = 1`. (False on either side means the badge is honest.)
+4. The UI can ALWAYS recover from STOPPED → RUNNING via the Start button. If it can't, that's a P0 bug.
+5. A runaway cycle is autonomously evicted within `WATCHDOG_CYCLE_TIMEOUT_SEC + WATCHDOG_TICK_SEC` (≤ 11 min by default).
 
 ---
 
@@ -259,6 +304,16 @@ Scheduler params live in `scheduler_state` table:
 | `exploration_mode` | 1 (until 50 trades closed) | 🤖 Robo-Trader tab |
 | `exploration_trades_target` | 50 | 🤖 Robo-Trader tab |
 | `kill_switch` | 0 | 🤖 Robo-Trader tab (Settings to clear) |
+| `cycle_started_at` | NULL (set during cycle, cleared after) | Internal — written by `_loop` |
+
+Watchdog knobs (deploy-time config, hardcoded — not user-facing):
+
+| Knob | Default | Module location | Purpose |
+|---|---|---|---|
+| `WATCHDOG_TICK_SEC` | 60 | `scheduler.py` | How often the watchdog wakes up |
+| `WATCHDOG_CYCLE_TIMEOUT_SEC` | 600 (10 min) | `scheduler.py` | Cycle is "runaway" if it exceeds this |
+| `WATCHDOG_TIMEOUT_OWNER_SENTINEL` | -1 | `scheduler.py` | Forces owner_pid mismatch for self-exit |
+| `CYCLE_DURATION_WARN_SEC` | 300 (5 min) | `scheduler.py` | Soft warn (no action) for slow-but-completed cycles |
 
 Live trigger params live in `live_trigger_config` table:
 
@@ -286,14 +341,16 @@ Persistence (v3.1.5):
 
 ```
 1. Streamlit Cloud kills old process, spawns new one
-2. app.py imports trigger db.init_db() (creates/migrates schema)
+2. app.py imports trigger db.init_db() (creates/migrates schema,
+   incl. cycle_started_at column v3.1.10)
 3. boot_restore_once() runs — if local DB is empty AND GITHUB_TOKEN set,
    restore from Gist (preserves brain across resets)
 4. app.py calls sched.ensure_started() — spawns daemon thread
 5. Thread immediately writes STARTED log with PID
-6. Thread sleeps until next scheduled boundary (v3.1.3 DEBOUNCE)
+6. start() also spawns the bursa-watchdog thread (v3.1.10)
+7. Thread sleeps until next scheduled boundary (v3.1.3 DEBOUNCE)
    → prevents instant scan on redeploy
-7. First real cycle runs at the next top-of-hour
+8. First real cycle runs at the next top-of-hour
 ```
 
 ### Wake-up sequence (every hour, after debounce)
@@ -302,31 +359,49 @@ Persistence (v3.1.5):
 1. HEARTBEAT logged (+update last_heartbeat, next_run_at, owner_pid)
 2. Hourly persistence backup fires (v3.1.5, rate-limited)
 3. Check kill_switch — if engaged, exit loop
-4. Check owner_pid — if not ours, exit (ghost eviction)
+4. Check owner_pid — if changed (incl. WATCHDOG sentinel -1), exit silently
 5. Check market hours via market_calendar.is_market_open()
      - if closed → log SKIP with reason + next event time, sleep
-6. If open: run _run_one_cycle()
-     a. Fetch fresh KLCI regime
-     b. Record regime snapshot to regime_history (v3.1.4)
-     c. Scan all ~80 tickers (parallel yfinance pulls)
-     d. Validate data via data_quality
-     e. Cache results in scan_cache table
-     f. AUTO-SETTLE if autoexit_enabled:
-        - Check active trades against SL/TP/trailing/time exits
-        - Close any that hit
-        - Feed each closed trade to learner.learn_from_trade_outcome()
-        - Trigger persistence.backup() if any trade closed (v3.1.5)
-     g. AUTO-ENTRY if autotrade_enabled AND in safe-entry window:
-        - Filter scan → GOLD BUY ≥ regime threshold
-        - For each: run_full_risk_check → execute_entry (if pass)
-        - Log AUTO_ENTRY_END with reason if zero entries fired
-          (v3.1.2 includes regime trend if BEAR + below-threshold)
+6. If open:
+     a. Stamp cycle_started_at = now (v3.1.10, watchdog hook)
+     b. Run _run_one_cycle()
+        i.   Fetch fresh KLCI regime
+        ii.  Record regime snapshot to regime_history (v3.1.4)
+        iii. Scan all ~80 tickers (parallel yfinance pulls, timeout=15s each)
+        iv.  Validate data via data_quality
+        v.   Cache results in scan_cache table
+        vi.  AUTO-SETTLE if autoexit_enabled:
+             - Check active trades against SL/TP/trailing/time exits
+             - Close any that hit
+             - Feed each closed trade to learner.learn_from_trade_outcome()
+             - Trigger persistence.backup() if any trade closed (v3.1.5)
+        vii. AUTO-ENTRY if autotrade_enabled AND in safe-entry window:
+             - Filter scan → GOLD BUY ≥ regime threshold
+             - For each: run_full_risk_check → execute_entry (if pass)
+             - Log AUTO_ENTRY_END with reason if zero entries fired
+               (v3.1.2 includes regime trend if BEAR + below-threshold)
+     c. Clear cycle_started_at = NULL (v3.1.10, in finally block)
+     d. If duration > 5 min: log CYCLE_SLOW (soft warn)
 7. Daily maintenance (only at 01:00-01:05 MYT, only one process wins via try_claim_daily_task):
      - prune_logs (keep last 5000 rows per log table)
      - train_setup_classifier (nightly ML retrain)
      - exploration_mode auto-disable if ≥ target trades
 8. Update last_run_at, next_run_at = top of next hour
 9. Sleep until next wake-up (interruptible by stop event)
+```
+
+### Watchdog sequence (every 60 s, in parallel)
+
+```
+1. Read scheduler_state. Is cycle_started_at set?
+2. Is owner_pid still our PID? (If not, skip — another process is in charge.)
+3. Compute age = now - cycle_started_at.
+4. If age > 600 s:
+     a. Log CYCLE_TIMEOUT (ERROR level)
+     b. Clear cycle_started_at, set running=0, set owner_pid=-1 (sentinel),
+        set last_error with stuck duration
+     c. Add the stuck scheduler thread's ident to _ORPHANED_THREAD_IDS
+5. Sleep 60 s (interruptible by _WATCHDOG_STOP_EVENT)
 ```
 
 ### Safe-entry window (v3.1.2)
@@ -461,6 +536,7 @@ breakout_bias = clip(wr_shrunk / 0.5, 0.75, 1.30)
 1. Sidebar shows 🤖 Robo-Trader 🟢 RUNNING with current heartbeat
 2. 🤖 Robo-Trader tab → check last_run_at within 1 hour
 3. 📜 Logs → Robo-Trader scheduler → see hourly HEARTBEAT events
+4. **v3.1.10:** also look for `WATCHDOG_STARTED` once per session, and absence of `CYCLE_TIMEOUT` events. A `CYCLE_SLOW` event is informational (cycle was slow but completed).
 
 ### I. Diagnose "zero auto-entries"
 The system self-explains in the AUTO_ENTRY_END log message. Common reasons:
@@ -492,7 +568,7 @@ If your data appears wiped (DB shows 0 trades, brain reset):
 cd <project_root>
 pip install -r requirements.txt
 pytest tests/ -q
-# Expect: 145 passed in ~3.5 seconds
+# Expect: 168 passed in ~30 seconds (v3.1.10)
 ```
 
 ### N. Renew the public holiday calendar (every January)
@@ -584,6 +660,25 @@ the data accumulated since the last successful backup is lost.
 So: when the banner appears, treat it as a high-priority task. The fix
 is 5 minutes; the cost of ignoring it can be weeks of lost brain learning.
 
+### P. Diagnose a stuck scheduler (v3.1.10)
+
+**Symptoms:**
+- 🤖 Robo-Trader status badge stays 🔴 STOPPED even after clicking Start
+- Heartbeat is older than 5 minutes
+- `last_run_at` hasn't advanced
+- Clicking Start / Force Restart / Kill-Switch + Start does nothing
+
+**Diagnosis order:**
+
+1. **Check the cycle log** — `📜 Logs → Robo-Trader scheduler`. Look for:
+   - `CYCLE_TIMEOUT` (ERROR) → the watchdog already detected a stuck cycle. The system should self-recover within the next Streamlit rerun.
+   - `CYCLE_SLOW` (WARN) → a recent cycle was slow but completed. Yahoo Finance may be degraded.
+   - `START_REJECT` / `ADOPT_THREAD` (INFO) → the duplicate-loop guards are firing. Should NOT prevent recovery in v3.1.10 (the orphan registry handles this).
+   - `BACKUP_FAIL` (WARN) → the Gist backup is failing. Check PAT.
+2. **Check `last_error`** in the 🤖 Robo-Trader tab — if it mentions "Watchdog forced handoff", that's the v3.1.10 recovery doing its job.
+3. **Click ▶️ Start** once. It should succeed even if a zombie thread is alive in the background. If it returns False, file a bug — the v3.1.10 orphan registry should have made this impossible.
+4. **If nothing else works** — Streamlit Cloud → Manage app → ⋮ → Reboot app. This kills the entire Python process, eliminating any zombie threads.
+
 ---
 
 ## 10. Bugs Fixed (chronological)
@@ -610,6 +705,14 @@ Each bug has a regression test guarding against its return.
 | v3.1.3 | Every GitHub push triggered an immediate scan | `test_loop_does_not_scan_immediately_on_start`, `test_run_once_still_bypasses_debounce` |
 | v3.1.4 | Cycle explanation didn't show regime trend (user couldn't tell if BEAR weakening) | `test_cycle_explanation_includes_trend_in_bear` and 6 others |
 | **v3.1.5** | **DB wiped on every container reset → brain reset every redeploy → self-learning impossible long-term** | **`test_encode_decode_roundtrip`, `test_boot_restore_skips_when_local_db_has_data`, `test_backup_rate_limit` and 7 others** |
+| v3.1.6 | ML classifier .pkl wasn't backed up + had no auto-train on boot → "Classifier not trained yet" indefinitely | `test_ml_persistence.py` |
+| v3.1.7 | Holiday list + GitHub PAT expiry were silent failure modes | `test_maintenance_reminders.py` |
+| v3.1.8 | Duplicate worker loops caused "10 SKIPs in 16 seconds" log spam from Streamlit reruns | `test_duplicate_worker_fix.py` (5 tests) |
+| v3.1.9 | start() permanently blocked when local _THREAD handle lost while DB heartbeat fresh; stop()'s join window too short for in-cycle threads | `test_start_after_stop_while_mid_cycle`, `test_run_one_cycle_aborts_when_owner_changed`, `test_start_adopts_alive_thread_when_handle_lost`, `test_start_bypasses_fresh_db_when_local_thread_dead`, `test_same_process_duplicate_start_rejected_by_db_guard` |
+| **v3.1.10** | **Stuck cycle (yfinance hang) survives stop() → start() Guard 2 adopts the zombie → UI permanently STOPPED with no recovery path** | **`test_zombie_thread_recovery.py` (3 tests)** |
+| **v3.1.10** | **No autonomous recovery from runaway cycles — required human to click Start** | **`test_watchdog_and_cycle_tracking.py` (8 tests)** |
+| **v3.1.10** | **conftest.py didn't reset scheduler module-level state → tests failed in isolation but passed in full suite (flaky)** | Fixed in `tests/conftest.py` — explicit teardown of `_THREAD`, `_ORPHANED_THREAD_IDS`, `_STOP_EVENT`, watchdog |
+| **v3.1.10** | **Two yfinance calls in `evaluation.py` lacked explicit `timeout=` — Performance tab could hang indefinitely on slow Yahoo days** | Defensive fix; covered by general yfinance audit |
 
 ---
 
@@ -626,6 +729,7 @@ Each bug has a regression test guarding against its return.
 | Public holiday list expires after 2027 | Must update yearly | Hardcoded in `market_calendar.MY_PUBLIC_HOLIDAYS` |
 | GitHub PAT expires | Backups silently fail | User must rotate ~yearly |
 | ML classifier .pkl not in Gist | Lost on container reset | Self-rebuilds nightly within 24h, so non-critical |
+| Python `threading` cannot interrupt blocking I/O | Watchdog recovers within N min, can't cut a stuck call short | Subprocess-based scan would be a 4× code increase; per-call HTTP timeouts cover the realistic cases |
 
 ### v4 candidates (when user is ready)
 
@@ -638,6 +742,7 @@ Each bug has a regression test guarding against its return.
 7. **Rolling-window learning** — fade brain priors older than N months so it adapts to market regime shifts
 8. **ML classifier in backup** — include .pkl in Gist so it persists across resets
 9. **Multi-revision restore UI** — let user pick which historical backup to restore (currently always latest)
+10. **Subprocess-isolated market scan** — run `screen_all_stocks()` in a subprocess with hard `timeout=` so a Yahoo hang can be `SIGKILL`ed (currently we recover within 10 min via watchdog, but the cycle itself still wastes that time)
 
 ### Intentional "v4 scaffolding" (kept on purpose, not dead code)
 
@@ -671,6 +776,7 @@ When making changes, follow these patterns to keep the system honest and maintai
 3. **If it adds a new SQLite table, ensure it's covered by the Gist backup automatically** (it is — entire DB is backed up)
 4. Update `PROJECT_HANDBOOK.md` (this file) section 4 and section 6
 5. Update `USER_GUIDE.md` if user-facing
+6. **If it makes an external HTTP/network call, it MUST have an explicit `timeout=` kwarg** (v3.1.10 invariant; the watchdog is the safety net, not the first line of defence)
 
 ### When changing defaults
 1. Update `db.py` schema seed
@@ -686,33 +792,42 @@ When making changes, follow these patterns to keep the system honest and maintai
 5. Verify Streamlit still boots
 6. Update section 5 module table if removing a whole module
 
+### When touching the scheduler
+1. **Read section 4.16 / 4.17 / 4.18 / 4.19 first.** The duplicate-loop / zombie / watchdog story is non-trivial and has accumulated multiple subtle fixes.
+2. The `is_running()` badge MUST be honest — if you change it, also change the tests in `test_zombie_thread_recovery.py`.
+3. If you add a new long-running operation inside `_run_one_cycle`, make sure all external I/O has explicit timeouts. The watchdog catches infinite hangs at 10 min but it shouldn't be your first line of defence.
+4. Module-level state (`_THREAD`, `_ORPHANED_THREAD_IDS`, `_WATCHDOG_THREAD`) must be reset between tests — see `conftest.py`.
+
 ### When debugging on Streamlit Cloud
 1. Check 📜 Logs → Robo-Trader scheduler first
-2. Look for ERROR-level rows, CYCLE_ERROR, GHOST_EXIT
+2. Look for ERROR-level rows, CYCLE_ERROR, CYCLE_TIMEOUT (v3.1.10), GHOST_EXIT
 3. If ghost thread suspected → Streamlit Cloud → Manage app → Reboot app
 4. After significant code changes, also reboot to start fresh
 
-### Architectural completeness checks (lesson learned in v3.1.5)
+### Architectural completeness checks (lesson learned in v3.1.5 + reinforced in v3.1.10)
 **Always question your own infrastructure assumptions early.** Before designing any long-running system, ask:
 - "Where does the data live, and what kills it?"
 - "What's the cost of losing 1 week of operational data?"
 - "If I had to recover from total infrastructure loss, how long would it take?"
 - "What grows unbounded over the system's life?"
 - "What's the longest-running scenario the design has actually been validated for?"
+- "If the loop gets stuck, how long before the system recovers without human intervention?" (v3.1.10 lesson)
 
-The v3.1.5 Gist backup should have been part of the v2 design, not a v3.1.5 hotfix. For a system whose core value is "self-learning over time", data durability is a core feature, not an ops concern.
+The v3.1.5 Gist backup should have been part of the v2 design, not a v3.1.5 hotfix. Likewise the v3.1.10 watchdog should have been part of v3.1 — for a system whose value comes from continuous unattended operation, automatic recovery is a core feature, not an ops concern.
 
 ### Code style
 - Type hints on every public function
 - Docstrings explain *why* not *what*
 - All SQL via `repository.py` — never raw SQL in business logic
 - Wrap external calls (yfinance, Telegram, SMTP, GitHub Gist) in try/except — never crash the scheduler
+- **All external calls must have explicit `timeout=` kwargs** (v3.1.10)
 - Log every state change to the appropriate audit table
 
 ### Testing discipline
-- 145 tests, all passing, in ~3.5 seconds
+- 168 tests, all passing, in ~30 seconds (v3.1.10; was 145 at v3.1.7)
 - New features must include tests
 - Bug fixes must include regression tests
+- **Tests must pass both in isolation AND in the full suite** — `conftest.py` resets scheduler module state between tests (v3.1.10 fix for pre-existing flakiness)
 - Run `pytest tests/ -q` before every push to GitHub
 
 ---
@@ -730,9 +845,10 @@ and in **⚙️ Settings → 🗓️ Long-Term Maintenance Status** (see v3.1.7)
 | Review walk-forward optimization results and re-run if market regime has fundamentally shifted | Quarterly | Every 3 months (system reminds at 90+ days) | 🧠 AI Learning tab → Run Walk-Forward Optimization |
 | Review Performance tab calibration chart and per-regime stats | Monthly | First weekend of each month | 📊 Performance tab |
 | Verify Gist backup is still working (check 🗄️ Persistent Backup status in Settings) | Weekly | Open the app — Settings tab | ⚙️ Settings → 🗄️ Persistent Backup |
+| Scan for `CYCLE_TIMEOUT` / `CYCLE_SLOW` events in scheduler log (v3.1.10) | Weekly | 📜 Logs tab | If recurring, Yahoo Finance is degraded — investigate or wait it out |
 
 ### What you DON'T need to maintain
-- The scheduler thread itself (self-healing)
+- The scheduler thread itself (self-healing, watchdog-protected)
 - Log table sizes (auto-pruned nightly at 5,000 rows per table)
 - The Bayesian brain (auto-evolves with each closed trade)
 - ML classifier (retrained nightly)
@@ -742,6 +858,7 @@ and in **⚙️ Settings → 🗓️ Long-Term Maintenance Status** (see v3.1.7)
 - Drawdown level — if it crosses 8% the agent halves position sizes; at 15% all trading pauses
 - State priors growth — should keep adding new states as the agent encounters new market conditions
 - Calibration chart accuracy — if "80% confidence" picks only win 50%, retune
+- **Frequency of CYCLE_TIMEOUT / CYCLE_SLOW events (v3.1.10)** — occasional ones are fine (Yahoo blip); regular ones mean it's time to investigate the data source or add a secondary feed
 
 ---
 
@@ -758,8 +875,8 @@ and in **⚙️ Settings → 🗓️ Long-Term Maintenance Status** (see v3.1.7)
 | `bias_history` | No | Bias drift audit trail |
 | `state_priors` | No | Per (state_id, action) Beta(α,β) |
 | `learning_events` | No | Bayes updates, ML training, walk-forward |
-| `scheduler_log` | No | HEARTBEAT, SKIP, CYCLE_OK, errors |
-| `scheduler_state` | Yes | Running flag, last/next run, owner_pid, toggles |
+| `scheduler_log` | No | HEARTBEAT, SKIP, CYCLE_OK, CYCLE_SLOW, CYCLE_TIMEOUT, errors |
+| `scheduler_state` | Yes | Running flag, last/next run, owner_pid, toggles, **cycle_started_at (v3.1.10)** |
 | `trade_log` | No | Every ENTRY/EXIT/REJECT execution event |
 | `data_quality_log` | No | Per-ticker validation issues |
 | `scan_cache` | Yes | Most recent screener output |
@@ -769,6 +886,7 @@ and in **⚙️ Settings → 🗓️ Long-Term Maintenance Status** (see v3.1.7)
 | `alert_log` | No | Every alert sent/skipped/failed |
 | `maintenance_state` | No (one row per task) | Daily-task idempotency CAS |
 | `regime_history` | No | Per-cycle KLCI regime snapshots (v3.1.4) |
+| `meta` | No (key/value) | Cross-container state (Gist marker, PAT rotation timestamp) — v3.1.9 |
 
 **All tables are inside `~/.bursa_agent_data/bursa_agent.db` and are backed up to the Gist as a single file.**
 
@@ -787,6 +905,8 @@ python -m scheduler --interval 3600
 pytest tests/ -q
 pytest tests/test_trading_engine.py -v   # specific file
 pytest tests/ -k "cash_conservation"      # match by name
+pytest tests/test_zombie_thread_recovery.py -v        # v3.1.10 regression
+pytest tests/test_watchdog_and_cycle_tracking.py -v   # v3.1.10 regression
 
 # Reset everything (nuclear)
 rm -rf ~/.bursa_agent_data/
@@ -806,6 +926,10 @@ python -c "from persistence import backup; print(backup(force=True, reason='manu
 
 # Manually restore from latest Gist (in Python REPL)
 python -c "from persistence import restore; print(restore())"
+
+# Inspect the watchdog state (v3.1.10)
+sqlite3 ~/.bursa_agent_data/bursa_agent.db \
+  "SELECT cycle_started_at, owner_pid, running, last_error FROM scheduler_state WHERE id=1"
 ```
 
 ---

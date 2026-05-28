@@ -1092,11 +1092,9 @@ with tab_robo:
             if ok:
                 st.success("Started.")
             else:
-                st.warning(
-                    "Did not start — a scheduler thread may already exist "
-                    "or the DB shows a fresh heartbeat. Check 📜 Logs → "
-                    "Robo-Trader scheduler for START_REJECT / ADOPT_THREAD. "
-                    "If stuck, use ♻️ Force Restart."
+                st.info(
+                    "Scheduler is already running (start() returned False). "
+                    "Check 📜 Logs → Robo-Trader scheduler if unexpected."
                 )
             st.rerun()
     else:
@@ -1110,8 +1108,7 @@ with tab_robo:
             res = sched.run_once()
         st.success(f"Done: {res}")
     if cc[3].button("🚨 Kill-Switch", use_container_width=True):
-        update_scheduler_state(kill_switch=1)
-        sched.stop()
+        sched.engage_kill_switch()
         st.error("Kill-switch engaged. Scheduler will not restart "
                  "until cleared in Settings.")
         st.rerun()

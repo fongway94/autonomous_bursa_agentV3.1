@@ -339,3 +339,92 @@ def record_daily_task_result(task_name: str, result: str) -> None:
             "UPDATE maintenance_state SET result=? WHERE task_name=?",
             (result, task_name),
         )
+
+# =========================================================================
+# REGIME HISTORY (v3.1.4) — for trend analysis in cycle explanations
+# =========================================================================
+
+def record_regime_snapshot(regime: str, conviction: float,
+                            trend_score: float | None = None,
+                            ema_200_vs_price: float | None = None,
+                            klci_rsi: float | None = None) -> None:
+    """
+    Append a regime snapshot. Called once per cycle by the scheduler.
+
+    Each row captures (timestamp, regime, conviction, key indicators) so
+    we can later compute trend deltas like "BEAR conviction was 50% an
+    hour ago, now 40% → weakening; entries may resume soon".
+    """
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone(timedelta(hours=8))).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    with connect() as c:
+        c.execute(
+            "INSERT INTO regime_history "
+            "(timestamp, regime, conviction, trend_score, "
+            " ema_200_vs_price, klci_rsi) VALUES (?,?,?,?,?,?)",
+            (now, regime, float(conviction),
+             float(trend_score) if trend_score is not None else None,
+             float(ema_200_vs_price) if ema_200_vs_price is not None else None,
+             float(klci_rsi) if klci_rsi is not None else None),
+        )
+
+
+def get_regime_trend(lookback_hours: int = 24) -> dict:
+    """
+    Returns a summary of how the regime has evolved over the last N hours.
+
+    {
+      "current_conviction": float,
+      "avg_recent_conviction": float,
+      "change": float,                # current - avg_recent
+      "direction": "STRENGTHENING" | "WEAKENING" | "STABLE",
+      "ema_200_distance_pct": float | None,
+      "samples": int
+    }
+    """
+    from datetime import datetime, timezone, timedelta
+    myt = timezone(timedelta(hours=8))
+    cutoff = (datetime.now(myt) - timedelta(hours=lookback_hours)
+              ).strftime("%Y-%m-%d %H:%M:%S")
+    with connect(readonly=True) as c:
+        rows = c.execute(
+            "SELECT regime, conviction, ema_200_vs_price "
+            "FROM regime_history "
+            "WHERE timestamp >= ? ORDER BY id ASC",
+            (cutoff,),
+        ).fetchall()
+
+    if not rows:
+        return {"current_conviction": None, "avg_recent_conviction": None,
+                "change": None, "direction": "UNKNOWN",
+                "ema_200_distance_pct": None, "samples": 0}
+
+    current = rows[-1]
+    current_conv = float(current["conviction"])
+
+    # Skip the very latest row when computing the "recent" average,
+    # so the comparison is current vs prior trend.
+    prior = rows[:-1] if len(rows) > 1 else rows
+    avg_prior = float(sum(r["conviction"] for r in prior) / len(prior))
+
+    change = current_conv - avg_prior
+    if abs(change) < 3:
+        direction = "STABLE"
+    elif change > 0:
+        # In BEAR, rising conviction = BEAR getting stronger (bad)
+        # In BULL, rising conviction = BULL getting stronger (good)
+        direction = "STRENGTHENING"
+    else:
+        direction = "WEAKENING"
+
+    return {
+        "current_conviction": round(current_conv, 1),
+        "avg_recent_conviction": round(avg_prior, 1),
+        "change": round(change, 1),
+        "direction": direction,
+        "ema_200_distance_pct": (round(float(current["ema_200_vs_price"]), 2)
+                                  if current["ema_200_vs_price"] is not None
+                                  else None),
+        "samples": len(rows),
+    }

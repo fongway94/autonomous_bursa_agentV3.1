@@ -4,6 +4,9 @@ Pytest config:
 
 * Redirect DATA_DIR to a temp directory for every test session.
 * Re-import all DB-touching modules so they see the new path.
+* Reset module-level state between tests (scheduler thread handle,
+  orphan registry, stop event) so each test starts from a clean slate
+  regardless of run order. v3.1.10.
 """
 
 import os
@@ -49,7 +52,8 @@ def _reset_db_between_tests():
                     "scan_cache", "alert_log", "maintenance_state",
                     "regime_history", "meta", "custom_watchlist"):
             c.execute(f"DELETE FROM {tbl}")
-        # Reset scheduler_state singleton to v3 defaults
+        # Reset scheduler_state singleton to v3 defaults.
+        # v3.1.10: also clears cycle_started_at (added for the watchdog).
         c.execute(
             "UPDATE scheduler_state SET "
             "running=0, interval_sec=3600, last_run_at=NULL, "
@@ -57,7 +61,7 @@ def _reset_db_between_tests():
             "consecutive_failures=0, last_error=NULL, "
             "autotrade_enabled=1, autoexit_enabled=1, kill_switch=0, "
             "exploration_mode=1, exploration_trades_target=50, "
-            "owner_pid=0 "
+            "owner_pid=0, cycle_started_at=NULL "
             "WHERE id=1"
         )
         # Reset live_trigger_config singleton
@@ -85,3 +89,43 @@ def _reset_db_between_tests():
         "atr_period": 14, "atr_multiplier_stop": 1.5,
         "min_price": 0.30, "max_price": 4.00,
     }, source="TEST", reason="reset")
+
+    # v3.1.10: reset scheduler module-level state so per-test runs don't
+    # leak threads/orphans/stop signals across each other. Without this,
+    # tests like test_start_and_stop_idempotent failed when run alone
+    # because a previous test's _THREAD handle stayed set.
+    try:
+        import scheduler
+        # Best-effort: signal any live thread to exit, then drop the handle.
+        try:
+            scheduler._STOP_EVENT.set()
+        except Exception:
+            pass
+        try:
+            if scheduler._THREAD is not None and scheduler._THREAD.is_alive():
+                scheduler._THREAD.join(timeout=2)
+        except Exception:
+            pass
+        scheduler._THREAD = None
+        try:
+            scheduler._STOP_EVENT.clear()
+        except Exception:
+            pass
+        try:
+            scheduler._ORPHANED_THREAD_IDS.clear()
+        except Exception:
+            pass
+        # Reset the once-per-process silent-exit log latch
+        if hasattr(scheduler._loop, "_silent_exit_logged"):
+            try:
+                delattr(scheduler._loop, "_silent_exit_logged")
+            except Exception:
+                pass
+        # v3.1.10: tear down any watchdog from prior test
+        try:
+            scheduler._stop_watchdog()
+        except Exception:
+            pass
+    except Exception:
+        # scheduler may not be importable in some collection paths; skip
+        pass

@@ -1,0 +1,10 @@
+Recommendations for Where to Invest Next
+If you have spare time/energy to improve it, ranked by ROI:
+
+Do nothing for 2 months and just let it run. The brain needs trades to be useful. Premature feature work is wasted if you don't have data showing what to optimize.
+
+At month 2, look at the calibration chart in Performance tab. If 80% confidence picks actually win ~80%, the brain is calibrated — you can start trusting Telegram alerts for real-money mirroring. If it's miscalibrated (say 80% confidence wins only 50%), that's your highest-priority signal to investigate.
+
+At month 3, run walk-forward optimization — the system will remind you. If the recommended params drift significantly from current defaults, you've learned something about market regime change.
+
+Only then consider v4 work — Moomoo broker integration, live capital tracking, rolling-window learning. Doing these before validating the paper-trade signal is premature optimization.

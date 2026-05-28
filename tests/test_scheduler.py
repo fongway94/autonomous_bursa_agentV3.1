@@ -203,3 +203,62 @@ def test_run_once_still_bypasses_debounce(monkeypatch):
     result = scheduler.run_once()
     assert called[0]
     assert result["scan_count"] == 5
+
+
+# --- Regression: same-process duplicate thread guard (v3.1.8) ---
+
+def test_same_process_duplicate_start_rejected_by_db_guard(monkeypatch):
+    """
+    Bug from v3.1.8: _THREAD handle can be reset to None during Streamlit
+    module reloads or stop()/join(timeout) races while the actual daemon
+    thread continues running.  PID-based eviction only catches cross-
+    process ghosts; same-PID duplicates slip through and create scan
+    storms (multiple concurrent SCAN_START rows at the same hour).
+
+    Fix: start() now enforces three layers:
+      1) _THREAD handle check
+      2) threading.enumerate() scan for any alive 'bursa-scheduler'
+      3) DB heartbeat freshness check for this PID
+    """
+    import scheduler, time, os
+    from repository import update_scheduler_state, get_scheduler_state
+
+    def fake_cycle(*a, **k):
+        time.sleep(0.05)
+        return {"scan_count": 0, "settled": 0, "partials": 0,
+                "auto_entries": 0, "rejected": 0, "errors": []}
+
+    monkeypatch.setattr(scheduler, "_run_one_cycle", fake_cycle)
+    monkeypatch.setattr(scheduler, "_is_market_hours", lambda: False)
+
+    # Clean slate
+    scheduler.stop()
+    update_scheduler_state(running=0, owner_pid=0, kill_switch=0,
+                           last_heartbeat=None)
+    scheduler._THREAD = None
+    scheduler._STOP_EVENT.clear()
+    time.sleep(0.1)
+
+    # 1. First start should succeed
+    assert scheduler.start(interval_sec=60) is True
+    time.sleep(0.15)  # let thread enter loop and write DB state
+
+    # 2. Duplicate rejected by _THREAD handle (Guard 1)
+    assert scheduler.start(interval_sec=60) is False
+
+    # 3. Simulate lost-reference (e.g., Streamlit module reload)
+    saved_thread = scheduler._THREAD
+    scheduler._THREAD = None
+
+    # 4. start() must still reject because threading.enumerate() finds the
+    #    live 'bursa-scheduler' thread (Guard 2) and DB says running=1
+    #    with fresh heartbeat from same PID (Guard 3).
+    assert scheduler.start(interval_sec=60) is False, (
+        "start() must reject when a live same-process thread exists "
+        "even if the _THREAD handle is lost"
+    )
+
+    # Restore handle so cleanup works, then stop
+    scheduler._THREAD = saved_thread
+    scheduler.stop()
+    assert not scheduler.is_running()

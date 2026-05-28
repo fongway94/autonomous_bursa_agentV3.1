@@ -157,18 +157,17 @@ def test_start_adopt_thread_path_spawns_watchdog(monkeypatch):
 
     try:
         # User clicks Start (or app.py just calls start() on boot).
-        # This must hit the ADOPT_THREAD branch.
+        # v3.2: start() orphans the old thread and starts fresh.
         result = scheduler.start(interval_sec=60)
-        # start() returns False because it adopted rather than spawned
-        assert result is False, "expected ADOPT_THREAD branch (False)"
-        # But the watchdog MUST be alive
+        assert result is True, "v3.2: start() must orphan and start fresh"
+        # The watchdog MUST be alive
         time.sleep(0.2)
         assert scheduler._WATCHDOG_THREAD is not None, (
-            "start()'s ADOPT_THREAD branch must spawn the watchdog "
-            "before returning False — otherwise the live production path "
-            "has no autonomous recovery"
+            "start() must spawn the watchdog"
         )
         assert scheduler._WATCHDOG_THREAD.is_alive()
+        # Old thread should be orphaned
+        assert surviving_thread_ident in scheduler._ORPHANED_THREAD_IDS
     finally:
         scheduler.stop()
 

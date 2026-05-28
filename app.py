@@ -165,6 +165,21 @@ PLOTLY_LAYOUT = dict(
 # Bootstrap — start scheduler on app launch
 # =========================================================================
 
+# v3.1.5: BEFORE anything else, try to restore the DB from the configured
+# GitHub Gist backup. Idempotent — only runs once per Python process, and
+# only when local DB is empty (won't overwrite live data on every rerun).
+if "boot_restore_attempted" not in st.session_state:
+    try:
+        from persistence import boot_restore_once, is_configured
+        if is_configured():
+            r = boot_restore_once()
+            if r.get("ok"):
+                st.toast(f"♻️ Restored brain from backup "
+                         f"({r['bytes_restored']:,} bytes)", icon="✅")
+    except Exception as e:
+        st.warning(f"Backup restore skipped: {e}")
+    st.session_state["boot_restore_attempted"] = True
+
 # v3: call ensure_started on EVERY rerun — it's now self-healing
 # (will force-restart if the heartbeat is stale).
 try:
@@ -1344,6 +1359,69 @@ with tab_settings:
             st.rerun()
     else:
         st.caption("No custom tickers — add from the sidebar.")
+
+    # ---- v3.1.5: Persistent backup panel ----
+    st.markdown("### 🗄️ Persistent Backup (GitHub Gist)")
+    st.caption(
+        "Backs up your entire agent database (trades, brain learning, "
+        "parameters, settings) to a private GitHub Gist. Without this, "
+        "every Streamlit Cloud redeploy or 7-day sleep wipes all data."
+    )
+    from persistence import (get_status as _pers_status,
+                              backup as _pers_backup,
+                              restore as _pers_restore,
+                              is_configured as _pers_configured)
+    bstatus = _pers_status()
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Configured",
+              "✅ Yes" if bstatus["configured"] else "❌ No")
+    b2.metric("DB size", f"{bstatus['db_size_kb']:.1f} KB")
+    b3.metric("Last backup",
+              bstatus.get("last_backup_at") or "never")
+    b4.metric("Gist ID",
+              (bstatus.get("gist_id") or "—")[:12] + "…"
+              if bstatus.get("gist_id") else "—")
+
+    if not bstatus["configured"]:
+        st.warning(
+            "⚠️ **GITHUB_TOKEN not set.** Without it, your trade history, "
+            "Bayesian brain, and all settings will be wiped every time "
+            "Streamlit Cloud redeploys (every GitHub push, every 7-day "
+            "sleep). To enable persistence:\n\n"
+            "1. Create a fine-grained Personal Access Token at "
+            "https://github.com/settings/tokens?type=beta with scope: "
+            "**gist** (read+write).\n"
+            "2. Add to Streamlit Cloud → Manage app → Secrets:\n"
+            "   ```\n   GITHUB_TOKEN = \"github_pat_...\"\n   ```\n"
+            "3. Restart the app — first backup will create a private gist."
+        )
+    else:
+        bc1, bc2 = st.columns(2)
+        if bc1.button("💾 Backup now", type="primary",
+                       use_container_width=True):
+            with st.spinner("Uploading to Gist…"):
+                res = _pers_backup(force=True, reason="manual button")
+            if res["ok"]:
+                st.success(f"✅ Backup OK ({res['size_kb']:.1f} KB) → "
+                           f"gist {res['gist_id'][:12]}…")
+            else:
+                st.error(f"❌ Backup failed: {res['reason']}")
+            st.rerun()
+        if bc2.button("♻️ Restore from latest backup",
+                       use_container_width=True):
+            st.warning(
+                "⚠️ This will OVERWRITE your current local database "
+                "with the latest backup. Active positions, recent trades, "
+                "and brain learning since the last backup will be LOST."
+            )
+            if st.button("✅ Yes, restore (cannot be undone)"):
+                with st.spinner("Downloading from Gist…"):
+                    res = _pers_restore()
+                if res["ok"]:
+                    st.success(f"✅ Restored {res['bytes_restored']:,} bytes")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Restore failed: {res['reason']}")
 
     st.markdown("### Kill-Switch")
     ss = get_scheduler_state()

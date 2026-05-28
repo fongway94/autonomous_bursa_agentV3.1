@@ -18,7 +18,8 @@ bias_history          — every bias update with before/after
 state_priors          — Bayesian per-(state,action) Beta(alpha,beta) priors
 learning_events       — high-level learning journal
 scheduler_log         — robo-trader heartbeat + scheduled-run records
-scheduler_state       — single-row scheduler status (last/next run, running flag)
+scheduler_state       — single-row scheduler status (last/next run, running flag,
+                        cycle_started_at for watchdog — v3.1.10)
 trade_log             — append-only trade execution audit log
 data_quality_log      — issues detected during data fetch
 scan_cache            — most recent screener output (json)
@@ -240,7 +241,10 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     kill_switch     INTEGER NOT NULL DEFAULT 0,
     exploration_mode INTEGER NOT NULL DEFAULT 1,
     exploration_trades_target INTEGER NOT NULL DEFAULT 50,
-    owner_pid INTEGER NOT NULL DEFAULT 0
+    owner_pid INTEGER NOT NULL DEFAULT 0,
+    cycle_started_at TEXT           -- v3.1.10: set when a cycle begins,
+                                    -- cleared when it ends; powers the
+                                    -- runaway-cycle watchdog.
 );
 
 CREATE TABLE IF NOT EXISTS trade_log (
@@ -350,10 +354,15 @@ def init_db():
     with connect() as c:
         c.executescript(SCHEMA)
         # ---- Lightweight column migrations (v2 → v3 → v3.1) ----
+        # All wrapped individually in try/except — ALTER TABLE ... ADD COLUMN
+        # raises if the column already exists, which is the no-op case.
         for sql in (
             "ALTER TABLE scheduler_state ADD COLUMN exploration_mode INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE scheduler_state ADD COLUMN exploration_trades_target INTEGER NOT NULL DEFAULT 50",
             "ALTER TABLE scheduler_state ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0",
+            # v3.1.10: cycle_started_at lets the watchdog detect runaway cycles.
+            # NULL when no cycle is in flight; ISO timestamp when one is running.
+            "ALTER TABLE scheduler_state ADD COLUMN cycle_started_at TEXT",
             "ALTER TABLE trades ADD COLUMN executed_in_window TEXT",
         ):
             try:

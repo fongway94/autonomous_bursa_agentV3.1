@@ -262,3 +262,91 @@ def test_same_process_duplicate_start_rejected_by_db_guard(monkeypatch):
     scheduler._THREAD = saved_thread
     scheduler.stop()
     assert not scheduler.is_running()
+
+
+# --- v3.1.9 regressions ---
+
+def test_start_after_stop_while_mid_cycle(monkeypatch):
+    """
+    v3.1.9 regression: stop() during a long-running cycle must not
+    permanently block start().
+
+    Previously stop() used join(timeout=5) — if the cycle took longer
+    (e.g. 100s for a yfinance scan), the old thread was still alive.
+    start() Guard 2 saw it in threading.enumerate() and returned False
+    forever. The UI showed 🔴 STOPPED but Start did nothing.
+
+    Fix:
+      * stop() now clears owner_pid=0 and running=0 in DB.
+      * start() Guard 2 only blocks when DB says running=1 (legitimate).
+      * If DB says running=0, start() proceeds even if a zombie is
+        still finishing its cycle. The new owner_pid evicts the zombie
+        on its next wake-up.
+    """
+    import scheduler, time, threading
+    from repository import update_scheduler_state, get_scheduler_state
+
+    cycle_started = threading.Event()
+    can_finish_cycle = threading.Event()
+
+    def slow_cycle(*a, **k):
+        cycle_started.set()
+        can_finish_cycle.wait(timeout=5)
+        return {"scan_count": 0, "settled": 0, "partials": 0,
+                "auto_entries": 0, "rejected": 0, "errors": []}
+
+    monkeypatch.setattr(scheduler, "_run_one_cycle", slow_cycle)
+    monkeypatch.setattr(scheduler, "_is_market_hours", lambda: False)
+
+    # Clean slate
+    scheduler.stop()
+    update_scheduler_state(running=0, owner_pid=0, kill_switch=0,
+                           last_heartbeat=None)
+    scheduler._THREAD = None
+    scheduler._STOP_EVENT.clear()
+    time.sleep(0.1)
+
+    # Start a thread; it will enter slow_cycle and block
+    assert scheduler.start(interval_sec=60) is True
+    cycle_started.wait(timeout=2)
+
+    # Stop while mid-cycle
+    scheduler.stop()
+    assert scheduler._THREAD is None  # handle cleared by stop()
+
+    # At this point the old thread is still alive inside slow_cycle.
+    # start() must NOT be blocked forever.
+    t0 = time.time()
+    result = scheduler.start(interval_sec=60)
+    elapsed = time.time() - t0
+
+    assert elapsed < 1.0, (
+        f"start() blocked for {elapsed:.1f}s waiting for zombie — "
+        "users see Start button that does nothing"
+    )
+    assert result is True, "start() must succeed after stop()"
+
+    # Release the old zombie so it can finish and exit
+    can_finish_cycle.set()
+    time.sleep(0.3)
+
+    # Clean up
+    scheduler.stop()
+    assert not scheduler.is_running()
+
+
+def test_run_one_cycle_aborts_when_owner_changed(monkeypatch):
+    """
+    v3.1.9 regression: if a zombie thread is still mid-cycle when a new
+    thread claims ownership, the zombie must NOT log SCAN_START / do work
+    for that cycle.  It should abort at the top of _run_one_cycle().
+    """
+    import scheduler
+    from repository import update_scheduler_state
+
+    update_scheduler_state(running=1, owner_pid=99999)
+
+    # Call _run_one_cycle with my_pid=1, but DB says owner_pid=99999
+    result = scheduler._run_one_cycle(autotrade=False, autoexit=False,
+                                      my_pid=1)
+    assert result.get("aborted") is True

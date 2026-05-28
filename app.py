@@ -1292,17 +1292,54 @@ with tab_settings:
                                    step=5.0)
     daily_cap = c1.number_input("Daily trade limit",
                                  value=int(rp["max_trades_per_day"]), step=1)
+
+    # ---- Trading window controls (v3.1.2) ----
+    st.markdown("##### 🕘 Trading Window")
+    st.caption(
+        "Bursa Malaysia native sessions: 09:00–12:30 (morning) and "
+        "14:30–17:00 (afternoon). Lunch break + weekends + public "
+        "holidays are auto-detected. The user-configured window below "
+        "can only TIGHTEN this — it cannot extend past Bursa hours."
+    )
+    tw1, tw2 = st.columns(2)
+    no_before = tw1.text_input(
+        "No entries before (HH:MM MYT)",
+        value=str(rp.get("no_entry_before_time", "09:00")),
+        help="Default 09:00. Set to a later time if you want to wait "
+             "for the opening volatility to settle (e.g. 09:30).",
+    )
+    no_after = tw2.text_input(
+        "No entries after (HH:MM MYT)",
+        value=str(rp.get("no_entry_after_time", "17:00")),
+        help="Default 17:00. Note: the agent already enforces a "
+             "separate hard 16:00 cutoff for auto-entries so trades "
+             "have time to develop before close.",
+    )
+    # Show current market status for sanity
+    from market_calendar import market_status_text
+    ms = market_status_text()
+    st.info(f"📍 Right now: **{ms['session']}** — {ms['reason']}. "
+            f"Next event: {ms['next_event']}")
+
     if st.button("💾 Save Risk Parameters", type="primary"):
-        new_rp = {**rp,
-                  "max_drawdown_pct": float(max_dd),
-                  "max_drawdown_strict_pct": float(max_dd_strict),
-                  "max_concurrent_positions": int(max_pos),
-                  "max_risk_per_trade_pct": float(max_risk_pct),
-                  "max_position_cost_pct": float(max_pos_pct),
-                  "max_sector_exposure_pct": float(max_sec_pct),
-                  "max_trades_per_day": int(daily_cap)}
-        save_risk_params(new_rp)
-        st.success("Saved."); st.rerun()
+        import re
+        if not re.match(r"^\d{2}:\d{2}$", no_before) or \
+           not re.match(r"^\d{2}:\d{2}$", no_after):
+            st.error("Trading window times must be in HH:MM format "
+                     "(e.g. 09:00, not 9:00 or 9am).")
+        else:
+            new_rp = {**rp,
+                      "max_drawdown_pct": float(max_dd),
+                      "max_drawdown_strict_pct": float(max_dd_strict),
+                      "max_concurrent_positions": int(max_pos),
+                      "max_risk_per_trade_pct": float(max_risk_pct),
+                      "max_position_cost_pct": float(max_pos_pct),
+                      "max_sector_exposure_pct": float(max_sec_pct),
+                      "max_trades_per_day": int(daily_cap),
+                      "no_entry_before_time": no_before,
+                      "no_entry_after_time": no_after}
+            save_risk_params(new_rp)
+            st.success("Saved."); st.rerun()
 
     st.markdown("### Custom Watchlist")
     custom = load_custom_watchlist_tickers()

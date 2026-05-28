@@ -27,9 +27,15 @@ Requires ONE secret in Streamlit Cloud → Manage app → Secrets:
   # Personal Access Token (CLASSIC, not fine-grained) with scope: gist.
   # Generate at https://github.com/settings/tokens (NOT ?type=beta)
 
+Optionally, also set GIST_ID if you want to survive container resets
+without relying on the local marker file:
+
+  GIST_ID = "your-gist-id-here"
+
 The first backup will create the gist; subsequent backups update the
 same gist (we remember its ID in a tiny marker file inside the data dir,
-which itself is also backed up).
+which itself is also backed up).  v3.1.9 ALSO stores the gist_id in the
+SQLite `meta` table so it survives container resets via the Gist backup.
 
 Safety guarantees
 -----------------
@@ -39,6 +45,8 @@ Safety guarantees
 * DB file is compressed with gzip before upload (typically 4-10x smaller).
 * gzip + base64-encoded for Gist storage (Gists store text).
 * v3.1.6: ML classifier .pkl is also backed up alongside the DB.
+* v3.1.9: gist_id is stored in SQLite `meta` table (survives restore)
+  and GIST_ID env var is used as fallback when local marker is lost.
 """
 
 from __future__ import annotations
@@ -51,7 +59,7 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
-from db import DATA_DIR, DB_PATH
+from db import DATA_DIR, DB_PATH, get_meta, set_meta, myt_iso
 from logger import get_logger
 
 log = get_logger("persistence")
@@ -90,7 +98,17 @@ def _headers() -> dict:
     }
 
 
+# v3.1.9: read marker from DB meta first (survives container reset + restore),
+# then fall back to local JSON file for backwards compatibility.
 def _read_marker() -> dict:
+    # Primary: DB meta
+    try:
+        raw = get_meta("gist_marker")
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+    # Fallback: local file
     if not os.path.exists(MARKER_FILE):
         return {}
     try:
@@ -100,12 +118,17 @@ def _read_marker() -> dict:
         return {}
 
 
+# v3.1.9: write to DB meta (backed up in Gist) AND local file.
 def _write_marker(data: dict) -> None:
+    try:
+        set_meta("gist_marker", json.dumps(data))
+    except Exception as e:
+        log.warning(f"DB meta marker write failed: {e}")
     try:
         with open(MARKER_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        log.warning(f"marker write failed: {e}")
+        log.warning(f"file marker write failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +275,8 @@ def restore(gist_id: str | None = None) -> dict:
     Restore the DB from the configured Gist. Called once on boot,
     BEFORE the scheduler starts.
 
-    If `gist_id` not given, reads from marker file.
+    If `gist_id` not given, reads from DB meta (survives container resets)
+    then local marker file, then GIST_ID env var.
     """
     result = {"ok": False, "reason": "", "bytes_restored": 0,
               "gist_id": None}
@@ -262,10 +286,14 @@ def restore(gist_id: str | None = None) -> dict:
         return result
 
     if gist_id is None:
-        gist_id = _read_marker().get("gist_id")
+        # v3.1.9: DB meta is primary (survives restore), then file, then env
+        marker = _read_marker()
+        gist_id = marker.get("gist_id")
+        if not gist_id:
+            gist_id = os.environ.get("GIST_ID")
 
     if not gist_id:
-        result["reason"] = "no gist_id in marker (first run — nothing to restore)"
+        result["reason"] = "no gist_id in meta, marker, or GIST_ID env (first run — nothing to restore)"
         return result
 
     try:
@@ -319,6 +347,16 @@ def restore(gist_id: str | None = None) -> dict:
             except Exception as e:
                 log.warning(f"ML classifier restore failed (non-fatal): {e}")
 
+        # v3.1.9: store the gist_id in DB meta so next container reset
+        # can find it even if the marker file is wiped.
+        try:
+            _write_marker({
+                "gist_id": gist_id,
+                "restored_at": datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        except Exception:
+            pass
+
         result.update({"ok": True, "bytes_restored": bytes_restored,
                         "ml_bytes_restored": ml_bytes,
                         "gist_id": gist_id,
@@ -342,7 +380,7 @@ def get_status() -> dict:
     marker = _read_marker()
     return {
         "configured": is_configured(),
-        "gist_id": marker.get("gist_id"),
+        "gist_id": marker.get("gist_id") or os.environ.get("GIST_ID"),
         "last_backup_at": marker.get("last_backup_at"),
         "last_backup_size_kb": marker.get("last_backup_size_kb"),
         "last_reason": marker.get("last_reason"),

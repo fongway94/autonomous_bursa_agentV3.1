@@ -334,18 +334,38 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
 
 def _loop(interval_sec: int, my_pid: int):
     """The actual background loop. Exits when _STOP_EVENT is set,
-    kill_switch is engaged, or a newer process has claimed ownership."""
+    kill_switch is engaged, or a newer process has claimed ownership.
+
+    DEBOUNCE: On fresh startup (typical after a GitHub push triggers a
+    Streamlit Cloud redeploy), we DO NOT run a cycle immediately.
+    Instead we sleep until the next scheduled boundary. This prevents
+    multiple pushes within an hour from each triggering a full market
+    scan — which is wasteful (yfinance hits) and confusing in the logs.
+
+    The user can still force an immediate cycle via the "⚡ Run Cycle Now"
+    button in the Robo-Trader tab (it calls run_once() directly, bypassing
+    this debounce).
+    """
+    next_boundary = _next_run_at(interval_sec)
     update_scheduler_state(
         running=1,
         last_heartbeat=myt_iso(),
-        next_run_at=myt_iso(_next_run_at(interval_sec)),
+        next_run_at=myt_iso(next_boundary),
         last_error="",
         owner_pid=my_pid,
     )
     log_scheduler_event(
         "STARTED",
-        f"Robo-Trader started (PID {my_pid}, interval {interval_sec}s)",
+        f"Robo-Trader started (PID {my_pid}, interval {interval_sec}s). "
+        f"First cycle deferred to next boundary: "
+        f"{next_boundary.strftime('%Y-%m-%d %H:%M:%S')} MYT.",
     )
+
+    # Debounce: sleep until the next scheduled boundary before the first
+    # cycle. Allows early wake on stop event.
+    delay = max(0, (next_boundary - get_myt_now()).total_seconds())
+    if delay > 0:
+        _STOP_EVENT.wait(timeout=delay)
 
     while not _STOP_EVENT.is_set():
         state = get_scheduler_state()

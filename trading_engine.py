@@ -118,11 +118,6 @@ def calculate_trade_cost(shares: int, price: float) -> dict:
     return {"gross": gross, "fee": fee, "total": gross + fee}
 
 
-# Legacy shims for existing import sites in app.py
-def calculate_net_entry_price(p):
-    return p * (1 - TRANSACTION_COST_PCT)
-
-
 def round_to_lot(shares: int) -> int:
     """Floor shares down to nearest 100-share board lot. Returns 0 if <100."""
     if shares < LOT_SIZE:

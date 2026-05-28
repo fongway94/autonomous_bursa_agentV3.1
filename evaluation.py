@@ -202,9 +202,12 @@ def klci_buy_hold(equity_dates: pd.DatetimeIndex, initial_capital: float) -> pd.
         return pd.Series(dtype=float)
     try:
         start = equity_dates.min()
+        # v3.1.10: explicit timeout — was missing, could hang the Performance
+        # tab indefinitely on a slow yfinance day.
         df = yf.Ticker("^KLSE").history(
             start=start - pd.Timedelta(days=10),
-            end=equity_dates.max() + pd.Timedelta(days=1))
+            end=equity_dates.max() + pd.Timedelta(days=1),
+            timeout=30)
         if df.empty:
             return pd.Series(dtype=float)
         df = df["Close"].reindex(pd.date_range(start, equity_dates.max())).ffill()
@@ -228,8 +231,11 @@ def equal_weight_watchlist(equity_dates: pd.DatetimeIndex,
         eq = None
         for t in tickers:
             try:
+                # v3.1.10: explicit timeout — was missing, could hang the
+                # Performance tab indefinitely on a slow yfinance day.
                 df = yf.Ticker(t).history(start=start - pd.Timedelta(days=10),
-                                          end=end + pd.Timedelta(days=1))
+                                          end=end + pd.Timedelta(days=1),
+                                          timeout=15)
                 if df.empty:
                     continue
                 ok, _ = validate_ohlcv(df, t, min_rows=5)

@@ -325,6 +325,50 @@ tab_scanner, tab_portfolio, tab_learning, tab_perf, tab_robo, tab_logs, tab_aler
      "🔔 Live Alerts", "⚙️ Settings"]
 )
 
+# ---------------------------------------------------------------------------
+# v3.1.7: Long-term maintenance reminders — shown above all tabs
+# ---------------------------------------------------------------------------
+# Banners persist across reruns within a session but can be dismissed.
+# Overdue reminders CANNOT be dismissed — they re-appear until resolved.
+try:
+    from maintenance_reminders import get_all_reminders, reset_github_token_timer
+    _reminders = get_all_reminders()
+    if _reminders:
+        st.session_state.setdefault("_dismissed_reminders", set())
+        for _rem in _reminders:
+            rid = _rem["id"]
+            is_overdue = _rem["state"] == "overdue"
+            # Overdue cannot be dismissed
+            if rid in st.session_state["_dismissed_reminders"] and not is_overdue:
+                continue
+            with st.container():
+                color = "🚨" if is_overdue else "📢"
+                _nl = chr(10) + chr(10)
+                _msg = (f"### {color} {_rem['title']}" + _nl
+                        + f"{_rem['message']}" + _nl
+                        + f"**What to do:** {_rem['action']}" + _nl
+                        + f"**Deadline:** {_rem.get('deadline','—')}")
+                if is_overdue:
+                    st.error(_msg)
+                else:
+                    st.warning(_msg)
+                # Action buttons
+                cols = st.columns([1, 1, 4])
+                if _rem.get("show_reset_button"):
+                    if cols[0].button("✅ I rotated the token",
+                                       key=f"reset_{rid}"):
+                        reset_github_token_timer()
+                        st.session_state["_dismissed_reminders"].add(rid)
+                        st.success("Token timer reset. Next reminder in 11 months.")
+                        st.rerun()
+                if not is_overdue:
+                    if cols[1].button("Dismiss for this session",
+                                       key=f"dismiss_{rid}"):
+                        st.session_state["_dismissed_reminders"].add(rid)
+                        st.rerun()
+except Exception as _e:
+    pass  # reminders are a nice-to-have, never block the dashboard
+
 
 # =========================================================================
 # TAB 1 — Scanner

@@ -22,6 +22,8 @@ scheduler_state       — single-row scheduler status (last/next run, running fl
 trade_log             — append-only trade execution audit log
 data_quality_log      — issues detected during data fetch
 scan_cache            — most recent screener output (json)
+meta                  — key/value store for cross-container state (v3.1.9)
+custom_watchlist      — user-added tickers (v3.1.9, previously in watchlist.py only)
 """
 
 import sqlite3
@@ -324,6 +326,22 @@ CREATE TABLE IF NOT EXISTS regime_history (
     klci_rsi        REAL
 );
 CREATE INDEX IF NOT EXISTS idx_regime_at ON regime_history(timestamp);
+
+-- v3.1.9: meta table for key/value pairs that must survive container resets
+CREATE TABLE IF NOT EXISTS meta (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT
+);
+
+-- v3.1.9: custom_watchlist was previously created ad-hoc in watchlist.py.
+-- Moved into schema so init_db() creates it for fresh / restored DBs.
+CREATE TABLE IF NOT EXISTS custom_watchlist (
+    ticker      TEXT PRIMARY KEY,
+    name        TEXT,
+    sector      TEXT,
+    added_at    TEXT
+);
 """
 
 
@@ -409,6 +427,46 @@ def execute(sql, args=()):
 def executemany(sql, args_list):
     with connect() as c:
         return c.executemany(sql, args_list)
+
+
+# v3.1.9: meta key/value helpers — survive container resets via Gist backup
+
+def get_meta(key: str) -> str | None:
+    """Read a value from the meta table. Returns None if missing or table absent."""
+    try:
+        with connect(readonly=True) as c:
+            row = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+    except Exception:
+        return None
+
+
+def set_meta(key: str, value: str) -> None:
+    """Upsert a key/value pair into the meta table."""
+    try:
+        with connect() as c:
+            c.execute(
+                "INSERT INTO meta (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                (key, value, myt_iso()),
+            )
+    except Exception:
+        # Table might not exist in a DB restored from an older backup
+        try:
+            with connect() as c:
+                c.execute(
+                    "CREATE TABLE IF NOT EXISTS meta ("
+                    "key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT)"
+                )
+                c.execute(
+                    "INSERT INTO meta (key, value, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                    "updated_at=excluded.updated_at",
+                    (key, value, myt_iso()),
+                )
+        except Exception:
+            pass
 
 
 # Initialize on import so callers never have to remember.

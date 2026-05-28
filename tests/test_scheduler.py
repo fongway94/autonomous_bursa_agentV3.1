@@ -350,3 +350,101 @@ def test_run_one_cycle_aborts_when_owner_changed(monkeypatch):
     result = scheduler._run_one_cycle(autotrade=False, autoexit=False,
                                       my_pid=1)
     assert result.get("aborted") is True
+
+
+def test_start_adopts_alive_thread_when_handle_lost(monkeypatch):
+    """
+    v3.1.9 regression: if _THREAD handle is lost but the actual thread
+    is still alive, start() should adopt it rather than spawning a
+    duplicate or returning False permanently.
+    """
+    import scheduler, threading, time
+    from repository import update_scheduler_state, get_scheduler_state
+
+    def fake_cycle(*a, **k):
+        time.sleep(0.1)
+        return {"scan_count": 0, "settled": 0, "partials": 0,
+                "auto_entries": 0, "rejected": 0, "errors": []}
+
+    monkeypatch.setattr(scheduler, "_run_one_cycle", fake_cycle)
+    monkeypatch.setattr(scheduler, "_is_market_hours", lambda: False)
+
+    # Clean slate
+    scheduler.stop()
+    update_scheduler_state(running=0, owner_pid=0, kill_switch=0,
+                           last_heartbeat=None)
+    scheduler._THREAD = None
+    scheduler._STOP_EVENT.clear()
+    time.sleep(0.1)
+
+    # Start a thread normally
+    assert scheduler.start(interval_sec=60) is True
+    time.sleep(0.15)
+    assert scheduler.is_running()
+
+    # Simulate handle loss (e.g. module reload edge case)
+    saved_thread = scheduler._THREAD
+    scheduler._THREAD = None
+
+    # start() should adopt the alive thread and return False
+    result = scheduler.start(interval_sec=60)
+    assert result is False, "start() should adopt and not duplicate"
+    assert scheduler._THREAD is saved_thread, (
+        "start() did not adopt the alive thread into _THREAD handle"
+    )
+
+    # is_running() should now be True again
+    assert scheduler.is_running()
+
+    scheduler.stop()
+    assert not scheduler.is_running()
+
+
+def test_start_bypasses_fresh_db_when_local_thread_dead(monkeypatch):
+    """
+    v3.1.9 regression: if the scheduler thread crashed but DB still
+    shows running=1 with fresh heartbeat, start() must NOT be blocked
+    by Guard 3. It should start a new thread.
+    """
+    import scheduler, time
+    from repository import update_scheduler_state
+
+    def fake_cycle(*a, **k):
+        time.sleep(0.05)
+        return {"scan_count": 0, "settled": 0, "partials": 0,
+                "auto_entries": 0, "rejected": 0, "errors": []}
+
+    monkeypatch.setattr(scheduler, "_run_one_cycle", fake_cycle)
+    monkeypatch.setattr(scheduler, "_is_market_hours", lambda: False)
+
+    # Clean slate
+    scheduler.stop()
+    update_scheduler_state(running=0, owner_pid=0, kill_switch=0,
+                           last_heartbeat=None)
+    scheduler._THREAD = None
+    scheduler._STOP_EVENT.clear()
+    time.sleep(0.1)
+
+    # Simulate a crashed thread: _THREAD points to a dead Thread object
+    class DeadThread:
+        def is_alive(self): return False
+        ident = 12345
+        name = "bursa-scheduler"
+    scheduler._THREAD = DeadThread()
+
+    # Set DB to show running=1 with fresh heartbeat and our owner_pid
+    my_pid = scheduler.os.getpid()
+    from db import myt_iso
+    update_scheduler_state(running=1, owner_pid=my_pid,
+                           last_heartbeat=myt_iso())
+
+    # start() must NOT be blocked — it should see the local thread is
+    # dead and proceed to spawn a new one.
+    result = scheduler.start(interval_sec=60)
+    assert result is True, (
+        "start() was blocked by stale DB heartbeat even though local "
+        "thread is dead — scheduler cannot recover from a crash"
+    )
+
+    scheduler.stop()
+    assert not scheduler.is_running()

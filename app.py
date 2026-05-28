@@ -961,6 +961,27 @@ with tab_robo:
     st.markdown("### Recent Scheduler Log (50)")
     sl = get_scheduler_log(limit=50)
     if sl:
+        # ---- Ghost-thread detection (v3.1.1+) ----
+        # If two distinct message formats appear at the same timestamp,
+        # an old-codebase ghost thread is still running. Recommend reboot.
+        recent_50 = sl[:50]
+        old_format = [r for r in recent_50
+                       if r["event"] == "HEARTBEAT"
+                       and "(PID " not in (r["message"] or "")]
+        new_format = [r for r in recent_50
+                       if r["event"] == "HEARTBEAT"
+                       and "(PID " in (r["message"] or "")]
+        if old_format and new_format:
+            st.error(
+                "🧟 **Ghost thread detected** — your log shows both old "
+                "and new heartbeat formats. This means a thread from a "
+                "previous deploy is still running pre-PID-fix code and "
+                "cannot self-evict.\n\n"
+                "**Fix:** In Streamlit Cloud → Manage app → top-right "
+                "three-dots menu → **Reboot app**. After ~30s, only the "
+                "new process will be alive."
+            )
+
         st.dataframe(pd.DataFrame(sl)[["timestamp", "level", "event",
                                        "message", "duration_sec"]],
                      hide_index=True, use_container_width=True, height=350)

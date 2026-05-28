@@ -223,20 +223,40 @@ def prune_logs(max_rows_per_table: int = 5000):
 
 def dedupe_scheduler_log_at_same_second(keep_latest: bool = True) -> int:
     """
-    Remove duplicate scheduler_log rows that have identical
-    (timestamp, event, message). Keeps only one row per group.
+    Remove duplicate scheduler_log rows.
 
-    Returns the number of rows deleted. Cheap one-time cleanup
-    for the v3.1 ghost-thread incident.
+    Two sweeps:
+      1. Strict dedup: collapse rows with identical (timestamp, event, message).
+         Catches HEARTBEAT/SKIP multiplications from ghost threads.
+      2. Daily-task dedup: for NIGHTLY_RETRAIN / EXPLORATION_END events,
+         collapse multiple rows on the same MYT calendar day to just one.
+         Catches the case where ghost threads each produced *different*
+         OOS accuracy numbers but it was still semantically one event.
+
+    Returns the total number of rows deleted. Cheap one-time cleanup —
+    safe to call repeatedly (idempotent once duplicates are gone).
     """
     with connect() as c:
         before = c.execute("SELECT COUNT(*) FROM scheduler_log").fetchone()[0]
+
+        # Sweep 1: identical (timestamp, event, message)
         c.execute(
             "DELETE FROM scheduler_log WHERE id NOT IN ("
             "  SELECT MIN(id) FROM scheduler_log "
             "  GROUP BY timestamp, event, message"
             ")"
         )
+
+        # Sweep 2: per-day idempotent events — keep only the first row
+        # per (date, event_type) for events that should fire once a day.
+        c.execute(
+            "DELETE FROM scheduler_log WHERE id NOT IN ("
+            "  SELECT MIN(id) FROM scheduler_log "
+            "  GROUP BY substr(timestamp,1,10), event"
+            ") AND event IN ('NIGHTLY_RETRAIN', 'EXPLORATION_END', "
+            "                'MAINTENANCE_ERROR')"
+        )
+
         after = c.execute("SELECT COUNT(*) FROM scheduler_log").fetchone()[0]
     removed = before - after
     if removed > 0:

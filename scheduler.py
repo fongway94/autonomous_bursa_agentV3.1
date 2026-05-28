@@ -654,41 +654,74 @@ def start(interval_sec: int = 3600) -> bool:
     previous Streamlit Cloud deploy) will detect the PID change on
     its next iteration and exit cleanly.
 
-    v3.1.9: Guard 2 now uses DB `running` flag as the source of truth.
-    A zombie thread that hasn't finished its cycle yet (after stop())
-    no longer permanently blocks start().
+    v3.1.9: Guards 2 and 3 now correctly handle the case where the
+    local _THREAD handle is lost/crashed but the DB still shows a
+    fresh heartbeat. Previously this permanently blocked start().
     """
     global _THREAD
     with _LOCK:
+        my_pid = os.getpid()
+
         # Guard 1: module-level handle (fast, local)
         if _THREAD is not None and _THREAD.is_alive():
+            log_scheduler_event(
+                "START_REJECT",
+                f"PID {my_pid}: _THREAD handle points to alive thread",
+                "INFO",
+            )
             return False
 
-        my_pid = os.getpid()
         state = get_scheduler_state()
         db_running = bool(state.get("running", 0))
         db_owner = state.get("owner_pid", 0) or 0
 
-        # Guard 2: threading.enumerate() scan for any alive "bursa-scheduler"
-        # Only treat it as a blocker if the DB ALSO says running=1 and the
-        # owner matches us. If DB says stopped (running=0), any alive thread
-        # is a zombie finishing its last cycle — don't block forever.
+        # Guard 2: scan threading.enumerate() for any alive "bursa-scheduler".
+        # If we find one but our _THREAD handle is lost, adopt it.
+        # If we find one and DB says it's ours too, don't duplicate.
+        found_alive = None
         for t in threading.enumerate():
             if getattr(t, "name", None) == "bursa-scheduler" and t.is_alive():
-                if db_running and db_owner == my_pid:
-                    return False
-                # Zombie thread from a previous stop/start cycle.
-                # Log and proceed — the new owner_pid will evict it.
-                log_scheduler_event(
-                    "ZOMBIE_SKIP",
-                    f"Alive thread found but DB says running={int(db_running)} "
-                    f"owner={db_owner} — starting new thread anyway",
-                    "WARN",
-                )
+                found_alive = t
                 break
 
-        # Guard 3: DB heartbeat freshness for this PID
-        if (state.get("running") == 1 and state.get("owner_pid") == my_pid):
+        if found_alive is not None:
+            # If we have a local handle and it's the same thread, Guard 1
+            # already caught it. If _THREAD is dead/None but enumerate
+            # finds an alive one, adopt it rather than spawning a duplicate.
+            if _THREAD is None or not _THREAD.is_alive():
+                _THREAD = found_alive
+                log_scheduler_event(
+                    "ADOPT_THREAD",
+                    f"PID {my_pid}: adopted alive scheduler thread "
+                    f"{found_alive.ident} (handle was lost)",
+                    "WARN",
+                )
+                return False
+
+            # _THREAD handle exists but points to a different dead thread,
+            # while enumerate found another alive one. Proceed to start new;
+            # old will self-evict via owner_pid.
+            if db_running and db_owner == my_pid:
+                log_scheduler_event(
+                    "START_REJECT",
+                    f"PID {my_pid}: alive thread found, db_running=1 "
+                    f"owner={db_owner} — not starting duplicate",
+                    "INFO",
+                )
+                return False
+            log_scheduler_event(
+                "ZOMBIE_SKIP",
+                f"PID {my_pid}: alive thread found but DB says "
+                f"running={int(db_running)} owner={db_owner} — "
+                f"starting new thread anyway",
+                "WARN",
+            )
+
+        # Guard 3: DB heartbeat freshness for this PID.
+        # ONLY block if we have a local alive thread (Guard 1 or 2).
+        # If the thread crashed, the DB is stale — don't let it block recovery.
+        thread_alive = (_THREAD is not None and _THREAD.is_alive())
+        if thread_alive and (state.get("running") == 1 and state.get("owner_pid") == my_pid):
             hb = state.get("last_heartbeat")
             if hb:
                 try:
@@ -696,6 +729,12 @@ def start(interval_sec: int = 3600) -> bool:
                         tzinfo=timezone(timedelta(hours=8)))
                     age = (get_myt_now() - hb_dt).total_seconds()
                     if age < 300:
+                        log_scheduler_event(
+                            "START_REJECT",
+                            f"PID {my_pid}: heartbeat fresh ({age:.0f}s) — "
+                            f"already running",
+                            "INFO",
+                        )
                         return False
                 except Exception:
                     pass
@@ -729,6 +768,11 @@ def start(interval_sec: int = 3600) -> bool:
             name="bursa-scheduler", daemon=True,
         )
         _THREAD.start()
+        log_scheduler_event(
+            "START_OK",
+            f"PID {my_pid}: scheduler thread spawned",
+            "INFO",
+        )
         return True
 
 
@@ -776,16 +820,14 @@ def ensure_started(interval_sec: int = 3600,
 
     1. If another live owner exists → do nothing.
     2. If we own it and our local thread is alive → all good.
-    3. If stale/no owner → start.
-    4. If our local thread is a ghost (DB shows other owner) → force-restart.
+    3. If DB says we own it with fresh heartbeat but local thread handle
+       is lost/crashed → force-restart.
+    4. If stale/no owner → start.
+    5. If our local thread is a ghost (DB shows other owner) → force-restart.
 
     Streamlit re-runs the script on every interaction; daemon threads
     usually survive but can die silently if the parent process is restarted
     without killing children. The heartbeat check is the safety net.
-
-    v3.1.9: removed the Case 3 short-circuit that could return early
-    when _THREAD was lost but DB heartbeat was fresh.  That short-circuit
-    prevented self-healing after a stop/join race.
     """
     state = get_scheduler_state()
     current_owner = state.get("owner_pid", 0) or 0
@@ -810,12 +852,26 @@ def ensure_started(interval_sec: int = 3600,
     if current_owner == my_pid and is_running():
         return
 
-    # Case 3: stale or no owner — we should take over.
+    # Case 3: DB says we own it with fresh heartbeat, but local thread handle
+    # is lost (crashed, module reload, stop/join race). start() will reject
+    # (Guard 3). Force-restart to recover.
+    if current_owner == my_pid and not is_running():
+        if bool(state.get("running", 0)) and age is not None and age < 300:
+            log_scheduler_event(
+                "SELF_HEAL",
+                f"DB shows running with fresh heartbeat but local thread handle "
+                f"lost ({age:.0f}s old) — force-restarting",
+                "WARN",
+            )
+            force_restart(interval_sec=interval_sec)
+            return
+
+    # Case 4: genuinely stopped / stale owner → normal start
     if not is_running():
         start(interval_sec=interval_sec)
         return
 
-    # Case 4: thread alive locally but DB shows another owner — defer to DB.
+    # Case 5: thread alive locally but DB shows another owner — defer to DB.
     # This means our local thread is a stale ghost from a previous Streamlit
     # run. Stop it and let the rightful owner continue.
     threshold = max_heartbeat_age_sec or (interval_sec * 2 + 120)

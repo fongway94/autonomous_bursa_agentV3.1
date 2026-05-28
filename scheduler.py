@@ -65,7 +65,73 @@ def _is_market_hours() -> bool:
     tw = check_trading_time_window()
     return tw["allowed"]
 
+def _explain_cycle_outcome(summary: dict, df, regime: dict,
+                            threshold: float, active_count: int,
+                            max_positions: int,
+                            autotrade_enabled: bool) -> str:
+    """
+    Build a human-readable explanation of why a cycle ended with zero
+    new entries. Returns a short sentence ready to log.
 
+    Order of checks matches the actual cycle flow so the reason
+    reported is the FIRST blocking condition encountered.
+    """
+    regime_name = (regime or {}).get("regime_data", {}).get("regime", "?")
+
+    # 1. Auto-trade disabled
+    if not autotrade_enabled:
+        return ("Auto-entry is OFF. Toggle it on in 🤖 Robo-Trader tab "
+                "to let the agent open positions.")
+
+    # 2. Scan returned nothing
+    if df is None or len(df) == 0:
+        return ("Scanner returned 0 results — likely a yfinance data outage. "
+                "Check 📜 Logs → Data Quality.")
+
+    # 3. Count GOLD BUYs at all
+    gold_buys_all = df[df["signal"].astype(str).str.contains(
+        "GOLD BUY", regex=False)]
+    if len(gold_buys_all) == 0:
+        return (f"No GOLD BUY signals found across {len(df)} scanned stocks "
+                f"in {regime_name} regime. Market may be in distribution / "
+                "no breakout or pullback setups today.")
+
+    # 4. Above-threshold qualifiers
+    qualifiers = gold_buys_all[gold_buys_all["confidence"] >= threshold]
+    if len(qualifiers) == 0:
+        best_conf = float(gold_buys_all["confidence"].max())
+        return (f"{len(gold_buys_all)} GOLD BUY signal(s) found, but the "
+                f"highest confidence was {best_conf:.0f}/100 — below the "
+                f"{regime_name} regime threshold of {threshold:.0f}. "
+                "Agent stays defensive.")
+
+    # 5. Position cap
+    if active_count >= max_positions:
+        return (f"At max concurrent positions ({active_count}/{max_positions} "
+                f"in {regime_name} regime). Wait for existing positions to "
+                "close before opening new ones.")
+
+    # 6. All qualifiers already held
+    active_tickers = set()
+    try:
+        from repository import active_trades
+        active_tickers = {t["ticker"] for t in active_trades()}
+    except Exception:
+        pass
+    new_qualifiers = qualifiers[~qualifiers["ticker"].isin(active_tickers)]
+    if len(new_qualifiers) == 0:
+        return (f"{len(qualifiers)} qualifying GOLD BUY signal(s), but all "
+                "are already in active positions. No new entries possible.")
+
+    # 7. Some new qualifiers existed but all rejected by risk check
+    if summary.get("rejected", 0) > 0:
+        return (f"{summary['rejected']} qualifying signal(s) rejected by "
+                "risk checks (drawdown / position limit / sector cap / "
+                "daily limit). See 📜 Logs → Trade executions for details.")
+
+    # 8. Catch-all
+    return (f"{len(new_qualifiers)} candidate(s) existed but no entries "
+            "fired (lot-size rounding may have reduced shares below 100).")
 # -------------------------------------------------------------------------
 # Single cycle
 # -------------------------------------------------------------------------
@@ -141,11 +207,17 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
         if not is_safe_entry_window():
             sess = current_session()
             sess_name = sess.name if sess else "outside-session"
+            from market_calendar import market_status_text
+            ms = market_status_text()
             log_scheduler_event(
                 "AUTO_ENTRY_SKIP",
-                f"Outside safe-entry window (in {sess_name}). "
-                "New entries blocked.",
-                "INFO")
+                f"0 entries — In {sess_name} session "
+                f"({ms.get('reason', '')}). "
+                "New auto-entries only fire 09:00-12:30 and 14:30-16:00 MYT. "
+                f"Next opportunity: {ms.get('next_event', '?')}",
+                "INFO",
+                payload={"reason": "outside_safe_entry_window",
+                         "session": sess_name})
             return summary
         from repository import load_trades
         log_scheduler_event("AUTO_ENTRY_START", "Evaluating new entries")
@@ -217,12 +289,44 @@ def _run_one_cycle(autotrade: bool, autoexit: bool) -> dict:
             except Exception as e:
                 summary["errors"].append(f"{row['ticker']}: {e}")
 
-        log_scheduler_event("AUTO_ENTRY_END",
-                            f"{summary['auto_entries']} entries, "
-                            f"{summary['rejected']} rejected")
+        # Append a human-readable reason when nothing got opened
+        if summary["auto_entries"] == 0:
+            reason = _explain_cycle_outcome(
+                summary, df, regime, threshold,
+                active_count=len(active),
+                max_positions=regime.get("position_rules", {})
+                                   .get("max_concurrent_positions", 5),
+                autotrade_enabled=True,
+            )
+            log_scheduler_event(
+                "AUTO_ENTRY_END",
+                f"0 entries — {reason}",
+                payload={"reason": reason,
+                         "regime": regime.get("regime_data", {}).get("regime"),
+                         "threshold": threshold,
+                         "scan_count": summary["scan_count"]})
+        else:
+            log_scheduler_event(
+                "AUTO_ENTRY_END",
+                f"{summary['auto_entries']} entries, "
+                f"{summary['rejected']} rejected")
+
+    # If we get here without entering the autotrade block, autotrade is OFF
+    # OR df is empty. Make sure the cycle log still explains it.
+    elif autotrade:
+        log_scheduler_event(
+            "AUTO_ENTRY_END",
+            "0 entries — Scanner returned 0 results. Likely yfinance "
+            "outage; check 📜 Logs → Data Quality.",
+            payload={"reason": "empty_scan"})
+    else:
+        log_scheduler_event(
+            "AUTO_ENTRY_END",
+            "0 entries — Auto-entry is OFF. Toggle it on in "
+            "🤖 Robo-Trader tab to let the agent open positions.",
+            payload={"reason": "autotrade_disabled"})
 
     return summary
-
 
 # -------------------------------------------------------------------------
 # Loop

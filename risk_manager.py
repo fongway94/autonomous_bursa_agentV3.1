@@ -29,8 +29,8 @@ DEFAULT_RISK_PARAMS = {
     "max_correlation_threshold": 0.7,
     "max_trades_per_day": 5,
     "min_trades_per_week": 0,
-    "no_entry_before_time": "09:15",
-    "no_entry_after_time": "17:00",
+    "no_entry_before_time": "09:00",  # Bursa morning open
+    "no_entry_after_time": "17:00",   # Bursa TaL close
     "max_stop_loss_pct": 10.0,
     "min_stop_loss_pct": 1.5,
     "trailing_stop_activation": "TP1",

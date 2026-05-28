@@ -290,18 +290,34 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    # v3.1.9: start() can return False if a zombie thread is still dying.
-    # Give honest feedback instead of always saying "started".
+    # v3.1.9: Persist the Start button result in session_state so the
+    # warning survives the immediate st.rerun() and is visible to the user.
+    if "_scheduler_start_result" in st.session_state:
+        res = st.session_state.pop("_scheduler_start_result")
+        if res.get("ok"):
+            st.success(res.get("msg", "Robo-Trader started."))
+        else:
+            st.warning(res.get("msg", "Robo-Trader did not start — see Logs."))
+
     if not running:
         if st.button("♻️ Start Robo-Trader", use_container_width=True):
             ok = sched.start(interval_sec=int(ss.get("interval_sec", 3600)))
             if ok:
-                st.success("Robo-Trader started.")
+                st.session_state["_scheduler_start_result"] = {
+                    "ok": True, "msg": "Robo-Trader started."}
             else:
-                st.warning(
-                    "Robo-Trader was already running or is restarting — "
-                    "refresh in a few seconds."
-                )
+                # start() returns False for legitimate guards. If it persists,
+                # the scheduler log will show START_REJECT / ADOPT_THREAD
+                # events that explain why.
+                st.session_state["_scheduler_start_result"] = {
+                    "ok": False,
+                    "msg": (
+                        "Robo-Trader did not start. "
+                        "Check 📜 Logs → Robo-Trader scheduler for START_REJECT / "
+                        "ADOPT_THREAD / ZOMBIE_SKIP events. If stuck, click "
+                        "♻️ Force Restart in the 🤖 Robo-Trader tab."
+                    ),
+                }
             st.rerun()
     else:
         if st.button("🛑 Stop Robo-Trader", use_container_width=True):
@@ -980,7 +996,15 @@ with tab_robo:
     if not running:
         if cc[0].button("▶️ Start", use_container_width=True, type="primary"):
             ok = sched.start(int(ss.get("interval_sec", 3600)))
-            st.success("Started." if ok else "Already running — refresh.")
+            if ok:
+                st.success("Started.")
+            else:
+                st.warning(
+                    "Did not start — a scheduler thread may already exist "
+                    "or the DB shows a fresh heartbeat. Check 📜 Logs → "
+                    "Robo-Trader scheduler for START_REJECT / ADOPT_THREAD. "
+                    "If stuck, use ♻️ Force Restart."
+                )
             st.rerun()
     else:
         if cc[0].button("🛑 Stop", use_container_width=True):
@@ -1521,6 +1545,17 @@ with tab_settings:
     b4.metric("Gist ID",
               (bstatus.get("gist_id") or "—")[:12] + "…"
               if bstatus.get("gist_id") else "—")
+
+    # v3.1.9: Warn if GITHUB_TOKEN is set but GIST_ID env var is missing
+    if bstatus["configured"] and not os.environ.get("GIST_ID"):
+        st.warning(
+            "⚠️ **GIST_ID env var not set.** If your local marker file is "
+            "wiped during a Streamlit Cloud container reset, the agent "
+            "won't know which Gist to restore from.\n\n"
+            "**Fix:** Go to Streamlit Cloud → Manage app → Secrets, add:\n"
+            "```\nGIST_ID = \"your-gist-id-here\"\n```\n"
+            "(Find your gist ID at https://gist.github.com/{your-username})"
+        )
 
     if not bstatus["configured"]:
         st.warning(
